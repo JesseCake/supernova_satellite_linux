@@ -37,12 +37,15 @@ def read_frame(sock: socket.socket) -> Tuple[bytes, bytes]:
 # -------------------------
 # Audio IO (PyAudio)
 # -------------------------
-RATE = 16000
+MIC_RATE = 16000
+SPK_RATE = 44100
 CHANNELS = 1
 SAMPLE_WIDTH = 2  # int16
+INPUT_CHANNELS = 1
+OUTPUT_CHANNELS = 2         # <<< stereo out
 FORMAT = pyaudio.paInt16
 CHUNK = 1024  # streaming chunk to server
-OUTPUT_CHUNK = 1024  # playback chunk size
+OUTPUT_CHUNK = 2048  # playback chunk size
 
 def list_devices():
     p = pyaudio.PyAudio()
@@ -70,33 +73,32 @@ class AudioIO:
     def __init__(self):
         self.p = pyaudio.PyAudio()
 
-        # Show what PyAudio thinks the defaults are (optional)
-        try:
-            dinfo = self.p.get_default_input_device_info()
-            print("[audio] Default input:", dinfo.get("name"))
-        except Exception:
-            print("[audio] No default input detected")
+        # List devices (diagnostic)
+        print("=== PyAudio devices ===")
+        for i, name, ch_in, ch_out in list_devices():
+            print(f"{i:2d} | {name} | in:{ch_in} out:{ch_out}")
 
+        # Open OUTPUT explicitly on pulse (fallback to default if pulse missing)
         try:
-            dout = self.p.get_default_output_device_info()
-            print("[audio] Default output:", dout.get("name"))
-        except Exception:
-            print("[audio] No default output detected")
+            self.out = self.p.open(
+                format=FORMAT,
+                channels=2,
+                rate=SPK_RATE,  # 16k; Pulse will resample if needed
+                output=True,
+                frames_per_buffer=OUTPUT_CHUNK,
+                output_device_index=0,
+                start=False,
+            )
+            self.out.start_stream()
+            print("[audio] Output started. active:", self.out.is_active(), "stopped:", self.out.is_stopped())
+        except Exception as e:
+            print("[audio] FAILED to open/start output stream:", e)
+            raise
 
-        # Open default output (16k mono int16). PortAudio/Pulse will resample if needed.
-        self.out = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            output=True,
-            frames_per_buffer=OUTPUT_CHUNK
-            # NOTE: no output_device_index → uses default
-        )
         self._in_stream = None
 
     def open_input(self, frames_per_buffer: int):
-        # (Re)open the default input. Do this right before wake listening
-        # so GNOME device changes take effect.
+        # Reopen INPUT explicitly on pulse (fallback to default if pulse missing)
         if self._in_stream:
             try:
                 self._in_stream.close()
@@ -104,20 +106,41 @@ class AudioIO:
                 pass
             self._in_stream = None
 
-        self._in_stream = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=frames_per_buffer
-            # NOTE: no input_device_index → uses default
-        )
+        try:
+            self._in_stream = self.p.open(
+                format=FORMAT,
+                channels=1,
+                rate=MIC_RATE,
+                input=True,
+                frames_per_buffer=frames_per_buffer,
+                input_device_index=0,  # may be None (default)
+                start=False,
+            )
+            self._in_stream.start_stream()
+        except Exception as e:
+            print("[audio] FAILED to open/start input stream:", e)
+            raise
 
     def read_input(self, n_frames: int) -> bytes:
         return self._in_stream.read(n_frames, exception_on_overflow=False)
 
     def play_bytes(self, pcm_bytes: bytes):
-        self.out.write(pcm_bytes)
+        try:
+            if OUTPUT_CHANNELS == 2:
+                mono = np.frombuffer(pcm_bytes, dtype=np.int16)
+                stereo = np.repeat(mono, 2)          # L=R
+                pcm_bytes = stereo.tobytes()
+            self.out.write(pcm_bytes)
+        except Exception as e:
+            print("[audio] out.write() failed:", e)
+
+    def beep(self, freq=800.0, duration=0.5, volume=0.5, rate=16000):
+        n = int(rate * duration)
+        t = np.arange(n, dtype=np.float32) / rate
+        wave = np.sin(2 * np.pi * freq * t) * volume
+        pcm = (np.clip(wave, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        print(f"[audio] Beep: {freq}Hz/{duration}s → {len(pcm)} bytes")
+        self.play_bytes(pcm)
 
     def close(self):
         try:
@@ -128,6 +151,7 @@ class AudioIO:
             self.p.terminate()
         except Exception:
             pass
+
 
 # -------------------------
 # Playback worker
@@ -192,6 +216,11 @@ class SatelliteClient:
         self.playback = PlaybackThread(self.audio)
         self.playback.start()
 
+        print("[satellite] Playing startup beeps…")
+        self.audio.beep(800, 0.12, 0.2)   # high beep
+        time.sleep(0.08)
+        self.audio.beep(400, 0.12, 0.2)   # low beep
+
         # Porcupine (wake word)
         # Either provide custom .ppn paths via keyword_paths OR use built-in keyword names
         if keyword_paths:
@@ -239,20 +268,25 @@ class SatelliteClient:
             while True:
                 tag, payload = read_frame(self.sock)
                 if tag == b"TTS0":
+                    print(f"[recv] TTS0 {len(payload)} bytes")
                     # int16 mono 16k — play immediately
                     self.playback.enqueue(payload)
                 elif tag == b"BEEP":
+                    print(f"[recv] BEEP {len(payload)} bytes")
                     self.playback.enqueue(payload)
                 elif tag == b"RDY0":
+                    print("[recv] RDY0")
                     self._ready_event.set()
                 elif tag == b"CLOS":
+                    print("[recv] CLOS")
                     # server closing channel
                     self._ready_event.clear()
                 else:
                     # ignore unknown tags
-                    pass
+                    print(f"[recv] Unknown tag {tag!r} ({len(payload)} bytes)")
         except Exception:
             # socket closed or error — leave
+            print(f"[recv] receiver exiting: {e}")
             self._ready_event.clear()
 
     # ---------- satellite flow ----------
