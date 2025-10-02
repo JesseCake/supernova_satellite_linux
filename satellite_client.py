@@ -1,0 +1,388 @@
+import os
+import socket
+import struct
+import threading
+import queue
+import time
+from typing import Tuple, Optional
+
+import numpy as np
+import pyaudio
+import pvporcupine
+import yaml
+
+# -------------------------
+# Connection / framing
+# -------------------------
+FRAME_HDR = struct.Struct("<4sI")  # (type:4s, length:uint32)
+
+def pack_frame(tag: bytes, payload: bytes = b"") -> bytes:
+    return FRAME_HDR.pack(tag, len(payload)) + payload
+
+def read_exactly(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Socket closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def read_frame(sock: socket.socket) -> Tuple[bytes, bytes]:
+    header = read_exactly(sock, FRAME_HDR.size)
+    tag, length = FRAME_HDR.unpack(header)
+    payload = read_exactly(sock, length) if length else b""
+    return tag, payload
+
+# -------------------------
+# Audio IO (PyAudio)
+# -------------------------
+RATE = 16000
+CHANNELS = 1
+SAMPLE_WIDTH = 2  # int16
+FORMAT = pyaudio.paInt16
+CHUNK = 1024  # streaming chunk to server
+OUTPUT_CHUNK = 1024  # playback chunk size
+
+def list_devices():
+    p = pyaudio.PyAudio()
+    devs = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        devs.append((i, info["name"], info["maxInputChannels"], info["maxOutputChannels"]))
+    p.terminate()
+    return devs
+
+def find_device_indices_by_name(pa, input_name=None, output_name=None):
+    in_idx = out_idx = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        name = info["name"]
+        max_in = int(info["maxInputChannels"])
+        max_out = int(info["maxOutputChannels"])
+        if input_name and input_name in name and max_in > 0:
+            in_idx = i
+        if output_name and output_name in name and max_out > 0:
+            out_idx = i
+    return in_idx, out_idx
+
+class AudioIO:
+    def __init__(self):
+        self.p = pyaudio.PyAudio()
+
+        # Show what PyAudio thinks the defaults are (optional)
+        try:
+            dinfo = self.p.get_default_input_device_info()
+            print("[audio] Default input:", dinfo.get("name"))
+        except Exception:
+            print("[audio] No default input detected")
+
+        try:
+            dout = self.p.get_default_output_device_info()
+            print("[audio] Default output:", dout.get("name"))
+        except Exception:
+            print("[audio] No default output detected")
+
+        # Open default output (16k mono int16). PortAudio/Pulse will resample if needed.
+        self.out = self.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            output=True,
+            frames_per_buffer=OUTPUT_CHUNK
+            # NOTE: no output_device_index → uses default
+        )
+        self._in_stream = None
+
+    def open_input(self, frames_per_buffer: int):
+        # (Re)open the default input. Do this right before wake listening
+        # so GNOME device changes take effect.
+        if self._in_stream:
+            try:
+                self._in_stream.close()
+            except Exception:
+                pass
+            self._in_stream = None
+
+        self._in_stream = self.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=frames_per_buffer
+            # NOTE: no input_device_index → uses default
+        )
+
+    def read_input(self, n_frames: int) -> bytes:
+        return self._in_stream.read(n_frames, exception_on_overflow=False)
+
+    def play_bytes(self, pcm_bytes: bytes):
+        self.out.write(pcm_bytes)
+
+    def close(self):
+        try:
+            if self._in_stream:
+                self._in_stream.close()
+            if self.out:
+                self.out.close()
+            self.p.terminate()
+        except Exception:
+            pass
+
+# -------------------------
+# Playback worker
+# -------------------------
+class PlaybackThread(threading.Thread):
+    def __init__(self, audio: AudioIO):
+        super().__init__(daemon=True)
+        self.audio = audio
+        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=128)
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                data = self.queue.get(timeout=0.1)
+                if data is None:
+                    break
+                self.audio.play_bytes(data)
+            except queue.Empty:
+                continue
+
+    def enqueue(self, data: bytes):
+        try:
+            self.queue.put_nowait(data)
+        except queue.Full:
+            # drop if overloaded
+            pass
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+# -------------------------
+# Satellite client
+# -------------------------
+class SatelliteClient:
+    def __init__(
+        self,
+        server_host: str,
+        server_port: int,
+        porcupine_access_key: str,
+        keyword_paths: Optional[list] = None,
+        built_in_keywords: Optional[list] = None,
+        wake_sensitivity: float = 0.6,
+        silence_ms: int = 800,
+        level_threshold: int = 150,  # ~ RMS threshold to detect speech (int16)
+        audio_cfg=None,
+    ):
+        self.server_host = server_host
+        self.server_port = server_port
+        self.silence_ms = silence_ms
+        self.level_threshold = level_threshold
+
+        # Audio
+        # Audio device setup
+        self.audio_cfg = audio_cfg or {}
+
+        self.audio = AudioIO()
+        self.playback = PlaybackThread(self.audio)
+        self.playback.start()
+
+        # Porcupine (wake word)
+        # Either provide custom .ppn paths via keyword_paths OR use built-in keyword names
+        if keyword_paths:
+            self.porcupine = pvporcupine.create(
+                access_key=porcupine_access_key,
+                keyword_paths=keyword_paths,
+                sensitivities=[wake_sensitivity] * len(keyword_paths),
+            )
+        else:
+            if not built_in_keywords:
+                built_in_keywords = ["porcupine"]  # default built-in
+            self.porcupine = pvporcupine.create(
+                access_key=porcupine_access_key,
+                keywords=built_in_keywords,
+                sensitivities=[wake_sensitivity] * len(built_in_keywords),
+            )
+
+        # For wake detection, Porcupine tells us what frame length to read
+        self.frame_len = self.porcupine.frame_length
+
+        # Networking state
+        self.sock: Optional[socket.socket] = None
+        self._receiver = None
+        self._ready_event = threading.Event()  # set after RDY0
+
+    # ---------- networking ----------
+    def connect(self):
+        if self.sock:
+            self.sock.close()
+        self.sock = socket.create_connection((self.server_host, self.server_port))
+        # Start receiver thread
+        self._receiver = threading.Thread(target=self._recv_loop, daemon=True)
+        self._receiver.start()
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+    def _recv_loop(self):
+        try:
+            while True:
+                tag, payload = read_frame(self.sock)
+                if tag == b"TTS0":
+                    # int16 mono 16k — play immediately
+                    self.playback.enqueue(payload)
+                elif tag == b"BEEP":
+                    self.playback.enqueue(payload)
+                elif tag == b"RDY0":
+                    self._ready_event.set()
+                elif tag == b"CLOS":
+                    # server closing channel
+                    self._ready_event.clear()
+                else:
+                    # ignore unknown tags
+                    pass
+        except Exception:
+            # socket closed or error — leave
+            self._ready_event.clear()
+
+    # ---------- satellite flow ----------
+    def _send(self, tag: bytes, payload: bytes = b""):
+        self.sock.sendall(pack_frame(tag, payload))
+
+    def _rms_int16(self, pcm_bytes: bytes) -> float:
+        # quick-n-dirty speech activity metric
+        if not pcm_bytes:
+            return 0.0
+        arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+        return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+
+    def _stream_utterance(self):
+        """
+        After RDY0, stream microphone audio as AUD0 in chunks until local silence timeout.
+        We rely on the server's VAD, but sending STOP helps flush faster.
+        """
+        # Use a bigger chunk for network efficiency during streaming
+        self.audio.open_input(frames_per_buffer=CHUNK)
+
+        silence_start = None
+        # Start streaming loop
+        while True:
+            pcm = self.audio.read_input(CHUNK)  # int16 little-endian
+            # Send chunk
+            try:
+                self._send(b"AUD0", pcm)
+            except Exception:
+                break
+
+            # crude silence gate to decide when to stop
+            if self._rms_int16(pcm) < self.level_threshold:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif (time.time() - silence_start) * 1000 >= self.silence_ms:
+                    # Enough silence — end utterance
+                    try:
+                        self._send(b"STOP")
+                    except Exception:
+                        pass
+                    break
+            else:
+                silence_start = None
+
+    def wake_and_talk_once(self):
+        """
+        Blocks until wake word is detected, performs WAKE handshake,
+        waits for RDY0, streams an utterance, and then returns.
+        """
+        # Wake-word listening stream
+        self.audio.open_input(frames_per_buffer=self.frame_len)
+
+        #dbg = 0
+        print("[satellite] Listening for wake word...")
+        while True:
+            pcm = self.audio.read_input(self.frame_len)
+            #rms = self._rms_int16(pcm)
+            #dbg += 1
+            #if dbg % 50 == 0:
+            #    print(f"[debug] mic RMS: {rms:.1f}")
+
+            # Porcupine expects int16 little-endian mono
+            frame = np.frombuffer(pcm, dtype=np.int16)
+            result = self.porcupine.process(frame)
+            if result >= 0:
+                print("[satellite] Wake detected!")
+                break
+
+        # Connect (or reconnect) to the server and send WAKE
+        self.connect()
+        self._ready_event.clear()
+        try:
+            self._send(b"WAKE")
+        except Exception as e:
+            print(f"[satellite] Error sending WAKE: {e}")
+            self.close()
+            return
+
+        # Wait for RDY0 (server says “I’m here” via TTS0 while we wait)
+        print("[satellite] Waiting for RDY0 from server...")
+        if not self._ready_event.wait(timeout=5.0):
+            print("[satellite] Timed out waiting for RDY0.")
+            self.close()
+            return
+
+        print("[satellite] RDY0 received. Start talking.")
+        # Stream a single utterance
+        self._stream_utterance()
+
+        # Keep the connection open to receive TTS0 reply frames.
+        # We give it a short window; receiver thread will keep playing any incoming audio.
+        time.sleep(2.0)
+
+        # Done with this interaction; close socket and go back to wake loop
+        self.close()
+        print("[satellite] Interaction finished; back to wake listening.")
+
+    def run_forever(self):
+        try:
+            while True:
+                self.wake_and_talk_once()
+        except KeyboardInterrupt:
+            print("\n[satellite] Stopping...")
+        finally:
+            self.playback.stop()
+            self.audio.close()
+            try:
+                self.porcupine.delete()
+            except Exception:
+                pass
+
+def load_config(path="config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+# -------------------------
+# Entrypoint
+# -------------------------
+if __name__ == "__main__":
+
+    cfg = load_config()
+
+    client = SatelliteClient(
+        server_host=cfg["voice_server"]["host"],
+        server_port=int(cfg["voice_server"]["port"]),
+        porcupine_access_key=cfg["pv_access_key"],
+        keyword_paths=cfg["wake_word"].get("keyword_paths"),
+        wake_sensitivity=cfg["wake_word"].get("sensitivity", 0.6),
+        silence_ms=800,
+        level_threshold=150,
+    )
+    client.run_forever()

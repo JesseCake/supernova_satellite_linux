@@ -1,0 +1,9 @@
+pv_access_key: "1CeQQQEH0ZZkKyqHrxVyBGZ3g3BsYZUnIPaw1FFcxDAA7SAp5mt3eA=="
+voice_server:
+  host: "jetson.lan"
+  port: 10400
+wake_word:
+  keyword_paths:
+    - "Supernova_en_linux_v3_0_0.ppn"
+  sensitivity: 0.6
+
