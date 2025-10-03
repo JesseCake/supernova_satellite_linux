@@ -39,13 +39,12 @@ def read_frame(sock: socket.socket) -> Tuple[bytes, bytes]:
 # -------------------------
 MIC_RATE = 16000
 SPK_RATE = 44100
-CHANNELS = 1
 SAMPLE_WIDTH = 2  # int16
 INPUT_CHANNELS = 1
-OUTPUT_CHANNELS = 2         # <<< stereo out
+OUTPUT_CHANNELS = 1         # <<< stereo out
 FORMAT = pyaudio.paInt16
 CHUNK = 1024  # streaming chunk to server
-OUTPUT_CHUNK = 2048  # playback chunk size
+OUTPUT_CHUNK = 4096  # playback chunk size
 
 def list_devices():
     p = pyaudio.PyAudio()
@@ -74,19 +73,18 @@ class AudioIO:
         self.p = pyaudio.PyAudio()
 
         # List devices (diagnostic)
-        print("=== PyAudio devices ===")
-        for i, name, ch_in, ch_out in list_devices():
-            print(f"{i:2d} | {name} | in:{ch_in} out:{ch_out}")
+        #print("=== PyAudio devices ===")
+        #for i, name, ch_in, ch_out in list_devices():
+        #    print(f"{i:2d} | {name} | in:{ch_in} out:{ch_out}")
 
         # Open OUTPUT explicitly on pulse (fallback to default if pulse missing)
         try:
             self.out = self.p.open(
-                format=FORMAT,
-                channels=2,
+                format=pyaudio.paInt16,
+                channels=OUTPUT_CHANNELS,
                 rate=SPK_RATE,  # 16k; Pulse will resample if needed
                 output=True,
                 frames_per_buffer=OUTPUT_CHUNK,
-                output_device_index=0,
                 start=False,
             )
             self.out.start_stream()
@@ -108,31 +106,44 @@ class AudioIO:
 
         try:
             self._in_stream = self.p.open(
-                format=FORMAT,
+                format=pyaudio.paInt16,
                 channels=1,
                 rate=MIC_RATE,
                 input=True,
-                frames_per_buffer=frames_per_buffer,
-                input_device_index=0,  # may be None (default)
+                frames_per_buffer=1024,
+                #input_device_index=0,  # may be None (default)
                 start=False,
             )
             self._in_stream.start_stream()
         except Exception as e:
             print("[audio] FAILED to open/start input stream:", e)
             raise
+    
+    def pause_input(self):
+        """Pause mic capture (idempotent)."""
+        if self._in_stream and not self._in_stream.is_stopped():
+            try:
+                self._in_stream.stop_stream()
+                # print("[audio] input paused")
+            except Exception:
+                pass
+    def resume_input(self):
+        """Resume mic capture (idempotent)."""
+        if self._in_stream and self._in_stream.is_stopped():
+            try:
+                self._in_stream.start_stream()
+                # print("[audio] input resumed")
+            except Exception:
+                pass
 
     def read_input(self, n_frames: int) -> bytes:
+        """Block while paused so callers don't read from a stopped stream."""
+        while self._in_stream and self._in_stream.is_stopped():
+            time.sleep(0.005)
         return self._in_stream.read(n_frames, exception_on_overflow=False)
 
     def play_bytes(self, pcm_bytes: bytes):
-        try:
-            if OUTPUT_CHANNELS == 2:
-                mono = np.frombuffer(pcm_bytes, dtype=np.int16)
-                stereo = np.repeat(mono, 2)          # L=R
-                pcm_bytes = stereo.tobytes()
             self.out.write(pcm_bytes)
-        except Exception as e:
-            print("[audio] out.write() failed:", e)
 
     def beep(self, freq=800.0, duration=0.5, volume=0.5, rate=16000):
         n = int(rate * duration)
@@ -157,21 +168,43 @@ class AudioIO:
 # Playback worker
 # -------------------------
 class PlaybackThread(threading.Thread):
-    def __init__(self, audio: AudioIO):
+    def __init__(self, audio: AudioIO, speaking_event: threading.Event):
         super().__init__(daemon=True)
         self.audio = audio
         self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=128)
         self._stop = threading.Event()
+        self._speaking = False
+        self._speaking_event = speaking_event
+
+
+    def _set_speaking(self, val: bool):
+        if val != self._speaking:
+            self._speaking = val
+            if val:
+                self._speaking_event.set()
+            else:
+                self._speaking_event.clear()
 
     def run(self):
+        idle_grace = 0.15
+        last_write_t = 0.0
         while not self._stop.is_set():
             try:
                 data = self.queue.get(timeout=0.1)
-                if data is None:
-                    break
-                self.audio.play_bytes(data)
             except queue.Empty:
+                if self._speaking and (time.time() - last_write_t) >= idle_grace and self.queue.empty():
+                    self._set_speaking(False)
                 continue
+
+            if data is None:
+                break
+            if not self._speaking:
+                self._set_speaking(True)
+
+            self.audio.play_bytes(data)
+            last_write_t = time.time()
+
+        self._set_speaking(False)
 
     def enqueue(self, data: bytes):
         try:
@@ -213,7 +246,8 @@ class SatelliteClient:
         self.audio_cfg = audio_cfg or {}
 
         self.audio = AudioIO()
-        self.playback = PlaybackThread(self.audio)
+        self.speaking_event = threading.Event()
+        self.playback = PlaybackThread(self.audio, speaking_event=self.speaking_event)
         self.playback.start()
 
         print("[satellite] Playing startup beeps…")
@@ -284,7 +318,7 @@ class SatelliteClient:
                 else:
                     # ignore unknown tags
                     print(f"[recv] Unknown tag {tag!r} ({len(payload)} bytes)")
-        except Exception:
+        except Exception as e:
             # socket closed or error — leave
             print(f"[recv] receiver exiting: {e}")
             self._ready_event.clear()
@@ -309,9 +343,18 @@ class SatelliteClient:
         self.audio.open_input(frames_per_buffer=CHUNK)
 
         silence_start = None
+
         # Start streaming loop
         while True:
             pcm = self.audio.read_input(CHUNK)  # int16 little-endian
+
+            # If we are speaking (playing TTS/beeps), do NOT send audio.
+            if self.speaking_event.is_set():
+                # Optional: treat as silence for the local-stop timer
+                silence_start = None
+                time.sleep(0.01)  # yield; avoid busy loop
+                continue
+
             # Send chunk
             try:
                 self._send(b"AUD0", pcm)
