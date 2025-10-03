@@ -38,7 +38,7 @@ def read_frame(sock: socket.socket) -> Tuple[bytes, bytes]:
 # Audio IO (PyAudio)
 # -------------------------
 MIC_RATE = 16000
-SPK_RATE = 44100
+SPK_RATE = 16000
 SAMPLE_WIDTH = 2  # int16
 INPUT_CHANNELS = 1
 OUTPUT_CHANNELS = 1         # <<< stereo out
@@ -171,7 +171,7 @@ class PlaybackThread(threading.Thread):
     def __init__(self, audio: AudioIO, speaking_event: threading.Event):
         super().__init__(daemon=True)
         self.audio = audio
-        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=128)
+        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=-1) # unbounded
         self._stop = threading.Event()
         self._speaking = False
         self._speaking_event = speaking_event
@@ -303,10 +303,13 @@ class SatelliteClient:
                 tag, payload = read_frame(self.sock)
                 if tag == b"TTS0":
                     print(f"[recv] TTS0 {len(payload)} bytes")
+                    # Pre-mark speaking to block mic immediately
+                    self.speaking_event.set()
                     # int16 mono 16k — play immediately
                     self.playback.enqueue(payload)
                 elif tag == b"BEEP":
                     print(f"[recv] BEEP {len(payload)} bytes")
+                    self.speaking_event.set()
                     self.playback.enqueue(payload)
                 elif tag == b"RDY0":
                     print("[recv] RDY0")
@@ -334,47 +337,38 @@ class SatelliteClient:
         arr = np.frombuffer(pcm_bytes, dtype=np.int16)
         return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
 
-    def _stream_utterance(self):
+    def _stream_audio_session(self):
         """
-        After RDY0, stream microphone audio as AUD0 in chunks until local silence timeout.
-        We rely on the server's VAD, but sending STOP helps flush faster.
+        After RDY0, continuously stream mic audio as AUD0 until the server ends
+        the session (CLOS clears _ready_event) or the socket dies.
+        While the server is speaking (TTS/beeps), don't send mic audio.
         """
-        # Use a bigger chunk for network efficiency during streaming
         self.audio.open_input(frames_per_buffer=CHUNK)
+        was_speaking = False
 
-        silence_start = None
-
-        # Start streaming loop
-        while True:
-            pcm = self.audio.read_input(CHUNK)  # int16 little-endian
-
-            # If we are speaking (playing TTS/beeps), do NOT send audio.
+        while self._ready_event.is_set():
+            # If server is speaking, pause mic and wait
             if self.speaking_event.is_set():
-                # Optional: treat as silence for the local-stop timer
-                silence_start = None
-                time.sleep(0.01)  # yield; avoid busy loop
+                if not was_speaking:
+                    self.audio.pause_input()
+                    was_speaking = True
+                time.sleep(0.01)
                 continue
+            else:
+                if was_speaking:
+                    self.audio.resume_input()
+                    was_speaking = False
 
-            # Send chunk
+            try:
+                pcm = self.audio.read_input(CHUNK)
+            except Exception:
+                break
+
             try:
                 self._send(b"AUD0", pcm)
             except Exception:
                 break
-
-            # crude silence gate to decide when to stop
-            if self._rms_int16(pcm) < self.level_threshold:
-                if silence_start is None:
-                    silence_start = time.time()
-                elif (time.time() - silence_start) * 1000 >= self.silence_ms:
-                    # Enough silence — end utterance
-                    try:
-                        self._send(b"STOP")
-                    except Exception:
-                        pass
-                    break
-            else:
-                silence_start = None
-
+        
     def wake_and_talk_once(self):
         """
         Blocks until wake word is detected, performs WAKE handshake,
@@ -383,14 +377,9 @@ class SatelliteClient:
         # Wake-word listening stream
         self.audio.open_input(frames_per_buffer=self.frame_len)
 
-        #dbg = 0
         print("[satellite] Listening for wake word...")
         while True:
             pcm = self.audio.read_input(self.frame_len)
-            #rms = self._rms_int16(pcm)
-            #dbg += 1
-            #if dbg % 50 == 0:
-            #    print(f"[debug] mic RMS: {rms:.1f}")
 
             # Porcupine expects int16 little-endian mono
             frame = np.frombuffer(pcm, dtype=np.int16)
@@ -417,12 +406,15 @@ class SatelliteClient:
             return
 
         print("[satellite] RDY0 received. Start talking.")
-        # Stream a single utterance
-        self._stream_utterance()
+        # Stream until server ends the session (CLOS) or socket error
+        self._stream_audio_session()
 
-        # Keep the connection open to receive TTS0 reply frames.
-        # We give it a short window; receiver thread will keep playing any incoming audio.
-        time.sleep(2.0)
+        # Wait for local playback to fully drain before closing
+        deadline = time.time() + 30.0  # safety cap
+        while time.time() < deadline:
+            if not self.speaking_event.is_set() and self.playback.queue.empty():
+                break
+            time.sleep(0.05)
 
         # Done with this interaction; close socket and go back to wake loop
         self.close()
@@ -459,7 +451,5 @@ if __name__ == "__main__":
         porcupine_access_key=cfg["pv_access_key"],
         keyword_paths=cfg["wake_word"].get("keyword_paths"),
         wake_sensitivity=cfg["wake_word"].get("sensitivity", 0.6),
-        silence_ms=800,
-        level_threshold=150,
     )
     client.run_forever()
