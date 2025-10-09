@@ -251,9 +251,9 @@ class SatelliteClient:
         self.playback.start()
 
         print("[satellite] Playing startup beeps…")
-        self.audio.beep(800, 0.12, 0.2)   # high beep
+        self.audio.beep(800, 0.12, 0.6)   # high beep
         time.sleep(0.08)
-        self.audio.beep(400, 0.12, 0.2)   # low beep
+        self.audio.beep(400, 0.12, 0.6)   # low beep
 
         # Porcupine (wake word)
         # Either provide custom .ppn paths via keyword_paths OR use built-in keyword names
