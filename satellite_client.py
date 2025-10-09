@@ -41,10 +41,10 @@ MIC_RATE = 16000
 SPK_RATE = 16000
 SAMPLE_WIDTH = 2  # int16
 INPUT_CHANNELS = 1
-OUTPUT_CHANNELS = 1         # <<< stereo out
+OUTPUT_CHANNELS = 1         # mono out
 FORMAT = pyaudio.paInt16
-CHUNK = 1024  # streaming chunk to server
-OUTPUT_CHUNK = 4096  # playback chunk size
+CHUNK = 1024                # streaming chunk to server (must be multiple of Porcupine frame_len)
+OUTPUT_CHUNK = 4096         # playback chunk size
 
 def list_devices():
     p = pyaudio.PyAudio()
@@ -68,21 +68,40 @@ def find_device_indices_by_name(pa, input_name=None, output_name=None):
             out_idx = i
     return in_idx, out_idx
 
+class _InputRing:
+    """Tiny ring buffer so one capture stream can feed multiple consumers."""
+    def __init__(self, max_seconds=2, rate=16000, sample_width=2):
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._max_bytes = int(max_seconds * rate * sample_width)
+
+    def write(self, data: bytes):
+        with self._cond:
+            self._buf += data
+            if len(self._buf) > self._max_bytes:
+                self._buf = self._buf[-self._max_bytes:]
+            self._cond.notify_all()
+
+    def read_exact_frames(self, n_frames: int, sample_width=2) -> bytes:
+        need = n_frames * sample_width
+        with self._cond:
+            while len(self._buf) < need:
+                self._cond.wait(timeout=0.2)
+            out = bytes(self._buf[:need])
+            del self._buf[:need]
+            return out
+
 class AudioIO:
     def __init__(self):
         self.p = pyaudio.PyAudio()
 
-        # List devices (diagnostic)
-        #print("=== PyAudio devices ===")
-        #for i, name, ch_in, ch_out in list_devices():
-        #    print(f"{i:2d} | {name} | in:{ch_in} out:{ch_out}")
-
-        # Open OUTPUT explicitly on pulse (fallback to default if pulse missing)
+        # Output
         try:
             self.out = self.p.open(
                 format=pyaudio.paInt16,
                 channels=OUTPUT_CHANNELS,
-                rate=SPK_RATE,  # 16k; Pulse will resample if needed
+                rate=SPK_RATE,
                 output=True,
                 frames_per_buffer=OUTPUT_CHUNK,
                 start=False,
@@ -93,57 +112,50 @@ class AudioIO:
             print("[audio] FAILED to open/start output stream:", e)
             raise
 
-        self._in_stream = None
+        # Single capture path
+        self._cap_stream = None
+        self._cap_thread = None
+        self._cap_stop = threading.Event()
+        self._ring = _InputRing(max_seconds=2, rate=MIC_RATE, sample_width=SAMPLE_WIDTH)
 
-    def open_input(self, frames_per_buffer: int):
-        # Reopen INPUT explicitly on pulse (fallback to default if pulse missing)
-        if self._in_stream:
+    def _capture_loop(self, frames_per_buffer: int):
+        while not self._cap_stop.is_set():
             try:
-                self._in_stream.close()
+                data = self._cap_stream.read(frames_per_buffer, exception_on_overflow=False)
+                self._ring.write(data)
+            except Exception:
+                time.sleep(0.005)
+
+    def start_single_capture(self, frames_per_buffer: int, input_device_index: Optional[int] = None):
+        """Open ONE input stream and start a background reader into a ring buffer."""
+        if self._cap_stream:
+            try:
+                self._cap_stream.close()
             except Exception:
                 pass
-            self._in_stream = None
+            self._cap_stream = None
 
-        try:
-            self._in_stream = self.p.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=MIC_RATE,
-                input=True,
-                frames_per_buffer=1024,
-                #input_device_index=0,  # may be None (default)
-                start=False,
-            )
-            self._in_stream.start_stream()
-        except Exception as e:
-            print("[audio] FAILED to open/start input stream:", e)
-            raise
-    
-    def pause_input(self):
-        """Pause mic capture (idempotent)."""
-        if self._in_stream and not self._in_stream.is_stopped():
-            try:
-                self._in_stream.stop_stream()
-                # print("[audio] input paused")
-            except Exception:
-                pass
-    def resume_input(self):
-        """Resume mic capture (idempotent)."""
-        if self._in_stream and self._in_stream.is_stopped():
-            try:
-                self._in_stream.start_stream()
-                # print("[audio] input resumed")
-            except Exception:
-                pass
+        self._cap_stop.clear()
+        self._cap_stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=INPUT_CHANNELS,
+            rate=MIC_RATE,
+            input=True,
+            input_device_index=input_device_index,
+            frames_per_buffer=frames_per_buffer,
+            start=True,
+        )
+        self._cap_thread = threading.Thread(
+            target=self._capture_loop, args=(frames_per_buffer,), daemon=True
+        )
+        self._cap_thread.start()
 
-    def read_input(self, n_frames: int) -> bytes:
-        """Block while paused so callers don't read from a stopped stream."""
-        while self._in_stream and self._in_stream.is_stopped():
-            time.sleep(0.005)
-        return self._in_stream.read(n_frames, exception_on_overflow=False)
+    def read_frames(self, n_frames: int) -> bytes:
+        """Blocking read of exactly n_frames from the ring (returns int16 bytes)."""
+        return self._ring.read_exact_frames(n_frames, sample_width=SAMPLE_WIDTH)
 
     def play_bytes(self, pcm_bytes: bytes):
-            self.out.write(pcm_bytes)
+        self.out.write(pcm_bytes)
 
     def beep(self, freq=800.0, duration=0.5, volume=0.5, rate=16000):
         n = int(rate * duration)
@@ -155,14 +167,16 @@ class AudioIO:
 
     def close(self):
         try:
-            if self._in_stream:
-                self._in_stream.close()
+            self._cap_stop.set()
+            if self._cap_thread:
+                self._cap_thread.join(timeout=0.2)
+            if self._cap_stream:
+                self._cap_stream.close()
             if self.out:
                 self.out.close()
             self.p.terminate()
         except Exception:
             pass
-
 
 # -------------------------
 # Playback worker
@@ -171,11 +185,10 @@ class PlaybackThread(threading.Thread):
     def __init__(self, audio: AudioIO, speaking_event: threading.Event):
         super().__init__(daemon=True)
         self.audio = audio
-        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=-1) # unbounded
+        self.queue: "queue.Queue[bytes]" = queue.Queue(maxsize=-1)  # unbounded
         self._stop = threading.Event()
         self._speaking = False
         self._speaking_event = speaking_event
-
 
     def _set_speaking(self, val: bool):
         if val != self._speaking:
@@ -184,6 +197,10 @@ class PlaybackThread(threading.Thread):
                 self._speaking_event.set()
             else:
                 self._speaking_event.clear()
+
+    def flush(self):
+        with self.queue.mutex:
+            self.queue.queue.clear()
 
     def run(self):
         idle_grace = 0.15
@@ -210,7 +227,6 @@ class PlaybackThread(threading.Thread):
         try:
             self.queue.put_nowait(data)
         except queue.Full:
-            # drop if overloaded
             pass
 
     def stop(self):
@@ -233,7 +249,7 @@ class SatelliteClient:
         built_in_keywords: Optional[list] = None,
         wake_sensitivity: float = 0.6,
         silence_ms: int = 800,
-        level_threshold: int = 150,  # ~ RMS threshold to detect speech (int16)
+        level_threshold: int = 150,
         audio_cfg=None,
     ):
         self.server_host = server_host
@@ -242,21 +258,18 @@ class SatelliteClient:
         self.level_threshold = level_threshold
 
         # Audio
-        # Audio device setup
         self.audio_cfg = audio_cfg or {}
-
         self.audio = AudioIO()
         self.speaking_event = threading.Event()
         self.playback = PlaybackThread(self.audio, speaking_event=self.speaking_event)
         self.playback.start()
 
         print("[satellite] Playing startup beeps…")
-        self.audio.beep(800, 0.12, 0.6)   # high beep
+        self.audio.beep(800, 0.12, 0.6)
         time.sleep(0.08)
-        self.audio.beep(400, 0.12, 0.6)   # low beep
+        self.audio.beep(400, 0.12, 0.6)
 
         # Porcupine (wake word)
-        # Either provide custom .ppn paths via keyword_paths OR use built-in keyword names
         if keyword_paths:
             self.porcupine = pvporcupine.create(
                 access_key=porcupine_access_key,
@@ -265,27 +278,32 @@ class SatelliteClient:
             )
         else:
             if not built_in_keywords:
-                built_in_keywords = ["porcupine"]  # default built-in
+                built_in_keywords = ["porcupine"]
             self.porcupine = pvporcupine.create(
                 access_key=porcupine_access_key,
                 keywords=built_in_keywords,
                 sensitivities=[wake_sensitivity] * len(built_in_keywords),
             )
 
-        # For wake detection, Porcupine tells us what frame length to read
+        # Single input capture sized for Porcupine frame
         self.frame_len = self.porcupine.frame_length
+        self.audio.start_single_capture(frames_per_buffer=self.frame_len)
 
         # Networking state
         self.sock: Optional[socket.socket] = None
         self._receiver = None
         self._ready_event = threading.Event()  # set after RDY0
+        self._drop_tts_until_ready = False     # mute TTS after INT0 until RDY0
+
+        # Background wake loop (optional if you want hotword during TTS)
+        self._wake_thread = threading.Thread(target=self._wake_vad_loop, daemon=True)
+        self._wake_thread.start()
 
     # ---------- networking ----------
     def connect(self):
         if self.sock:
             self.sock.close()
         self.sock = socket.create_connection((self.server_host, self.server_port))
-        # Start receiver thread
         self._receiver = threading.Thread(target=self._recv_loop, daemon=True)
         self._receiver.start()
 
@@ -301,87 +319,107 @@ class SatelliteClient:
         try:
             while True:
                 tag, payload = read_frame(self.sock)
+
                 if tag == b"TTS0":
-                    print(f"[recv] TTS0 {len(payload)} bytes")
-                    # Pre-mark speaking to block mic immediately
+                    if self._drop_tts_until_ready:
+                        # print(f"[recv] TTS0 {len(payload)} bytes (dropped)")
+                        continue
+                    # print(f"[recv] TTS0 {len(payload)} bytes")
                     self.speaking_event.set()
-                    # int16 mono 16k — play immediately
                     self.playback.enqueue(payload)
+
                 elif tag == b"BEEP":
-                    print(f"[recv] BEEP {len(payload)} bytes")
+                    if self._drop_tts_until_ready:
+                        # print(f"[recv] BEEP {len(payload)} bytes (dropped)")
+                        continue
                     self.speaking_event.set()
                     self.playback.enqueue(payload)
+
                 elif tag == b"RDY0":
                     print("[recv] RDY0")
+                    self._drop_tts_until_ready = False
                     self._ready_event.set()
+
                 elif tag == b"CLOS":
                     print("[recv] CLOS")
-                    # server closing channel
                     self._ready_event.clear()
+
                 else:
-                    # ignore unknown tags
                     print(f"[recv] Unknown tag {tag!r} ({len(payload)} bytes)")
         except Exception as e:
-            # socket closed or error — leave
             print(f"[recv] receiver exiting: {e}")
             self._ready_event.clear()
 
     # ---------- satellite flow ----------
     def _send(self, tag: bytes, payload: bytes = b""):
+        # print(f"[send] {tag!r} {len(payload)} bytes")
         self.sock.sendall(pack_frame(tag, payload))
-
-    def _rms_int16(self, pcm_bytes: bytes) -> float:
-        # quick-n-dirty speech activity metric
-        if not pcm_bytes:
-            return 0.0
-        arr = np.frombuffer(pcm_bytes, dtype=np.int16)
-        return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
 
     def _stream_audio_session(self):
         """
         After RDY0, continuously stream mic audio as AUD0 until the server ends
         the session (CLOS clears _ready_event) or the socket dies.
-        While the server is speaking (TTS/beeps), don't send mic audio.
+        While speaking, don't send mic audio.
         """
-        self.audio.open_input(frames_per_buffer=CHUNK)
-        was_speaking = False
-
         while self._ready_event.is_set():
-            # If server is speaking, pause mic and wait
+            print("[debug] _ready_event is set, streaming audio...")
             if self.speaking_event.is_set():
-                if not was_speaking:
-                    self.audio.pause_input()
-                    was_speaking = True
-                time.sleep(0.01)
+                print("[debug] speaking_event is set, not sending audio")
+                time.sleep(0.005)
                 continue
-            else:
-                if was_speaking:
-                    self.audio.resume_input()
-                    was_speaking = False
-
             try:
-                pcm = self.audio.read_input(CHUNK)
-            except Exception:
-                break
-
-            try:
+                print("[debug] sending audio chunk...")
+                pcm = self.audio.read_frames(CHUNK)
                 self._send(b"AUD0", pcm)
             except Exception:
                 break
-        
+
+    def on_barge_in(self, reason="wake"):
+        """
+        Interrupt current TTS and prepare to capture user speech immediately.
+        """
+        was_speaking = self.speaking_event.is_set()
+
+        # Stop local output now
+        self.playback.flush()
+        self.speaking_event.clear()
+
+        try:
+            if self.sock and self._ready_event.is_set():
+                if was_speaking:
+                    print(f"[satellite] Barge-in ({reason}): interrupting TTS")
+                    self._drop_tts_until_ready = True
+                    self._send(b"INT0")
+            else:
+                print(f"[satellite] Barge-in ({reason}): sending WAKE")
+                self._send(b"WAKE")
+        except Exception:
+            pass
+
+    def _wake_vad_loop(self):
+        """
+        Runs continuously. While TTS is playing, listen for the wake word.
+        """
+        while True:
+            pcm = self.audio.read_frames(self.frame_len)
+            frame = np.frombuffer(pcm, dtype=np.int16)
+
+            # Wake word
+            if self.porcupine.process(frame) >= 0:
+                self.on_barge_in(reason="wake")
+                continue
+
+            # Optional: implement non-wake speech-over-TTS RMS barge-in here
+            # using 'frame' with your level_threshold
+
     def wake_and_talk_once(self):
         """
         Blocks until wake word is detected, performs WAKE handshake,
         waits for RDY0, streams an utterance, and then returns.
         """
-        # Wake-word listening stream
-        self.audio.open_input(frames_per_buffer=self.frame_len)
-
         print("[satellite] Listening for wake word...")
         while True:
-            pcm = self.audio.read_input(self.frame_len)
-
-            # Porcupine expects int16 little-endian mono
+            pcm = self.audio.read_frames(self.frame_len)
             frame = np.frombuffer(pcm, dtype=np.int16)
             result = self.porcupine.process(frame)
             if result >= 0:
@@ -398,7 +436,7 @@ class SatelliteClient:
             self.close()
             return
 
-        # Wait for RDY0 (server says “I’m here” via TTS0 while we wait)
+        # Wait for RDY0
         print("[satellite] Waiting for RDY0 from server...")
         if not self._ready_event.wait(timeout=5.0):
             print("[satellite] Timed out waiting for RDY0.")
@@ -409,14 +447,13 @@ class SatelliteClient:
         # Stream until server ends the session (CLOS) or socket error
         self._stream_audio_session()
 
-        # Wait for local playback to fully drain before closing
-        deadline = time.time() + 30.0  # safety cap
+        # Wait for local playback to drain before closing
+        deadline = time.time() + 30.0
         while time.time() < deadline:
             if not self.speaking_event.is_set() and self.playback.queue.empty():
                 break
             time.sleep(0.05)
 
-        # Done with this interaction; close socket and go back to wake loop
         self.close()
         print("[satellite] Interaction finished; back to wake listening.")
 
@@ -442,9 +479,7 @@ def load_config(path="config.yaml"):
 # Entrypoint
 # -------------------------
 if __name__ == "__main__":
-
     cfg = load_config()
-
     client = SatelliteClient(
         server_host=cfg["voice_server"]["host"],
         server_port=int(cfg["voice_server"]["port"]),
