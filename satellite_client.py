@@ -70,7 +70,7 @@ def find_device_indices_by_name(pa, input_name=None, output_name=None):
 
 class _InputRing:
     """Tiny ring buffer so one capture stream can feed multiple consumers."""
-    def __init__(self, max_seconds=2, rate=16000, sample_width=2):
+    def __init__(self, max_seconds=0.1, rate=16000, sample_width=2):
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -116,7 +116,7 @@ class AudioIO:
         self._cap_stream = None
         self._cap_thread = None
         self._cap_stop = threading.Event()
-        self._ring = _InputRing(max_seconds=2, rate=MIC_RATE, sample_width=SAMPLE_WIDTH)
+        self._ring = _InputRing(max_seconds=0.1, rate=MIC_RATE, sample_width=SAMPLE_WIDTH)
 
     def _capture_loop(self, frames_per_buffer: int):
         while not self._cap_stop.is_set():
