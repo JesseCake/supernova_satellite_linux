@@ -296,6 +296,8 @@ class SatelliteClient:
         self._drop_tts_until_ready = False     # mute TTS after INT0 until RDY0
 
         # Background wake loop (optional if you want hotword during TTS)
+        self._wake_enabled = threading.Event()
+        self._wake_enabled.clear()  # start enabled (idle state)
         self._wake_thread = threading.Thread(target=self._wake_vad_loop, daemon=True)
         self._wake_thread.start()
 
@@ -324,7 +326,9 @@ class SatelliteClient:
                     if self._drop_tts_until_ready:
                         # print(f"[recv] TTS0 {len(payload)} bytes (dropped)")
                         continue
-                    # print(f"[recv] TTS0 {len(payload)} bytes")
+                    #print(f"[recv] TTS0 {len(payload)} bytes")
+                    self._wake_enabled.set()  # allow wake during TTS
+
                     self.speaking_event.set()
                     self.playback.enqueue(payload)
 
@@ -332,16 +336,20 @@ class SatelliteClient:
                     if self._drop_tts_until_ready:
                         # print(f"[recv] BEEP {len(payload)} bytes (dropped)")
                         continue
+                    self._wake_enabled.set()  # allow wake during TTS
+
                     self.speaking_event.set()
                     self.playback.enqueue(payload)
 
                 elif tag == b"RDY0":
                     print("[recv] RDY0")
                     self._drop_tts_until_ready = False
+                    self._wake_enabled.clear()  # disable wake during user speech
                     self._ready_event.set()
 
                 elif tag == b"CLOS":
                     print("[recv] CLOS")
+                    self._wake_enabled.set()
                     self._ready_event.clear()
 
                 else:
@@ -362,15 +370,16 @@ class SatelliteClient:
         While speaking, don't send mic audio.
         """
         while self._ready_event.is_set():
-            print("[debug] _ready_event is set, streaming audio...")
+            #print("[debug] _ready_event is set, streaming audio...")
             if self.speaking_event.is_set():
-                print("[debug] speaking_event is set, not sending audio")
+                #print("[debug] speaking_event is set, not sending audio")
                 time.sleep(0.005)
                 continue
             try:
-                print("[debug] sending audio chunk...")
+                #print("[debug] sending audio chunk...")
                 pcm = self.audio.read_frames(CHUNK)
                 self._send(b"AUD0", pcm)
+                #print("[satellite] Sent AUD0 chunk")
             except Exception:
                 break
 
@@ -401,6 +410,10 @@ class SatelliteClient:
         Runs continuously. While TTS is playing, listen for the wake word.
         """
         while True:
+            if not self._wake_enabled.is_set():
+                time.sleep(0.1)
+                continue
+
             pcm = self.audio.read_frames(self.frame_len)
             frame = np.frombuffer(pcm, dtype=np.int16)
 
