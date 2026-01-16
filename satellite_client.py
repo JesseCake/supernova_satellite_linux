@@ -8,7 +8,7 @@ from typing import Tuple, Optional
 
 import numpy as np
 import pyaudio
-from openwakeword.model import Model as OWWModel
+#from openwakeword.model import Model as OWWModel
 import yaml
 
 import openwakeword
@@ -280,13 +280,14 @@ class SatelliteClient:
         model_path = wake_cfg.get("model_path", "./soopa_nowvva.onnx")
         self.wake_threshold = float(wake_cfg.get("threshold", 0.25))
         self.wake_cooldown_s = float(wake_cfg.get("cooldown_s", 0.8))
+        self.post_session_silence_s = 0.4      # ringdown after playback stops
 
         # OWW params
         self.oww_hop = 1280
         # Ensure resources are present
         ensure_oww_resources()
         # Load model
-        self.oww = OWWModel(wakeword_models=[model_path], inference_framework="onnx")
+        self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
 
         # Networking state
         self.sock: Optional[socket.socket] = None
@@ -349,6 +350,44 @@ class SatelliteClient:
             return 0.0
         arr = np.frombuffer(pcm_bytes, dtype=np.int16)
         return float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+
+    def _flush_wake_model(self, seconds: float = 2.0):
+        """
+        openWakeWord keeps internal state/buffer across predict() calls.
+        After a wake/session, flush it with silence so we don't immediately retrigger.
+        """
+        # If a reset method exists in your version, use it.
+        for name in ("reset", "reset_states", "reset_state"):
+            fn = getattr(self.oww, name, None)
+            if callable(fn):
+                fn()
+                return
+
+        # Otherwise, push silence through predict() to flush internal buffers.
+        n_samples = int(MIC_RATE * seconds)              # e.g. 2.0s -> 32000 samples
+        step = self.oww_hop                             # 1280 samples per frame (80ms)
+        silence = np.zeros(step, dtype=np.int16)
+
+        for _ in range((n_samples + step - 1) // step):
+            _ = self.oww.predict(silence)
+
+    
+    def _wait_playback_drain(self, timeout_s: float = 5.0):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if (not self.speaking_event.is_set()) and self.playback.queue.empty():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _flush_mic(self, n_frames: int, count: int):
+        # Read and discard a few frames to clear ALSA/Pulse buffers
+        for _ in range(count):
+            try:
+                _ = self.audio.read_input(n_frames)
+            except Exception:
+                break
+
 
     def _stream_audio_session(self):
         """
@@ -422,25 +461,33 @@ class SatelliteClient:
         # Wake-word listening stream
         self.audio.open_input(frames_per_buffer=self.oww_hop)
 
+        # Discard a few frames (clears buffered tail of TTS/beeps)
+        self._flush_mic(self.oww_hop, 3)
+
+
         print("[satellite] Listening for wake word...")
-        last_fire = 0.0
+        
+        next_allowed_wake_t = 0.0
 
         while True:
             pcm = self.audio.read_input(self.oww_hop)
             frame = np.frombuffer(pcm, dtype=np.int16)
-            
+
             pred = self.oww.predict(frame)
+            if not pred:
+                continue
 
+            model_name = max(pred, key=pred.get)
+            score = float(pred[model_name])
             now = time.time()
-            fired = False
-            for model_name, score in pred.items():
-                if score >= self.wake_threshold and (now-last_fire) >= self.wake_cooldown_s:
-                    print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
-                    last_fire = now
-                    fired = True
-                    break
 
-            if fired:
+            # simple time-based cooldown only
+            if now < next_allowed_wake_t:
+                continue
+
+            if score >= self.wake_threshold:
+                print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
+                next_allowed_wake_t = now + self.wake_cooldown_s
                 break
 
         # Connect (or reconnect) to the server and send WAKE
@@ -470,6 +517,12 @@ class SatelliteClient:
             if not self.speaking_event.is_set() and self.playback.queue.empty():
                 break
             time.sleep(0.05)
+
+        time.sleep(self.post_session_silence_s)
+
+        # Flush model state before returning to wake listening
+        self._flush_wake_model(seconds=2.0)
+
 
         # Done with this interaction; close socket and go back to wake loop
         self.close()
