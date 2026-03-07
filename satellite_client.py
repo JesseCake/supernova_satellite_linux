@@ -78,7 +78,7 @@ OUTPUT_CHUNK = 4096  # playback chunk size
 #   (prevents amplifying breath noise / silence between words).
 INPUT_GAIN_TARGET_RMS  = 0.2
 INPUT_GAIN_MAX_DB      = 20.0
-INPUT_GAIN_NOISE_FLOOR = 0.005
+INPUT_GAIN_NOISE_FLOOR = 0.05
 
 
 def list_devices():
