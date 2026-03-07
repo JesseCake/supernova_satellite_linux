@@ -230,7 +230,7 @@ class PlaybackThread(threading.Thread):
                 self._speaking_event.clear()
 
     def run(self):
-        idle_grace = 0.12
+        idle_grace = 0.3
         last_write_t = 0.0
         while not self._stop.is_set():
             try:
@@ -540,12 +540,12 @@ class SatelliteClient:
 
         time.sleep(self.post_session_silence_s)
 
+        # Done with this interaction; close socket and go back to wake loop
+        self.close()
+
         # Flush model state before returning to wake listening
         self._flush_wake_model(seconds=2.0)
 
-
-        # Done with this interaction; close socket and go back to wake loop
-        self.close()
         print("[satellite] Interaction finished; back to wake listening.")
 
     def run_forever(self):
