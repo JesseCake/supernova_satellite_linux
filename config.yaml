@@ -2,6 +2,6 @@ voice_server:
   host: "jetson.lan"
   port: 10400
 wake_word:
-  model_path: "./soopa_nowvva.onnx"
-  threshold: 0.25
-  cooldown_s: 0.8
+  model_path: "./soopanova.onnx"
+  threshold: 0.002
+  cooldown_s: 0.01

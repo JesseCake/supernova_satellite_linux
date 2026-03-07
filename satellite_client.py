@@ -68,6 +68,19 @@ FORMAT = pyaudio.paInt16
 CHUNK = 1024  # streaming chunk to server
 OUTPUT_CHUNK = 4096  # playback chunk size
 
+# Automatic mic input gain applied after every read_input() call.
+# Affects both wake-word detection and streamed AUD0 frames sent to the server.
+#
+# INPUT_GAIN_TARGET_RMS: desired loudness on a 0.0–1.0 float32 scale.
+#   Raise if wake word still misses or Whisper struggles; lower if over-driven.
+# INPUT_GAIN_MAX_DB: hard ceiling on gain so silence/noise isn't boosted to a roar.
+# INPUT_GAIN_NOISE_FLOOR: frames quieter than this RMS are left untouched
+#   (prevents amplifying breath noise / silence between words).
+INPUT_GAIN_TARGET_RMS  = 0.2
+INPUT_GAIN_MAX_DB      = 20.0
+INPUT_GAIN_NOISE_FLOOR = 0.005
+
+
 def list_devices():
     p = pyaudio.PyAudio()
     devs = []
@@ -162,7 +175,16 @@ class AudioIO:
         """Block while paused so callers don't read from a stopped stream."""
         while self._in_stream and self._in_stream.is_stopped():
             time.sleep(0.005)
-        return self._in_stream.read(n_frames, exception_on_overflow=False)
+        raw = self._in_stream.read(n_frames, exception_on_overflow=False)
+
+        # Auto-gain: normalise frame to TARGET_RMS, capped at MAX_DB, noise floor gated
+        arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(arr ** 2)))
+        if rms >= INPUT_GAIN_NOISE_FLOOR:
+            max_gain = 10.0 ** (INPUT_GAIN_MAX_DB / 20.0)
+            gain = min(INPUT_GAIN_TARGET_RMS / rms, max_gain)
+            arr = np.clip(arr * gain, -1.0, 1.0)
+        return (arr * 32767.0).astype(np.int16).tobytes()
 
     def play_bytes(self, pcm_bytes: bytes):
             self.out.write(pcm_bytes)
@@ -261,7 +283,6 @@ class SatelliteClient:
         self.level_threshold = level_threshold
         self.wake_cfg = wake_cfg
 
-        # Audio
         # Audio device setup
         self.audio_cfg = audio_cfg or {}
 
@@ -276,10 +297,9 @@ class SatelliteClient:
         self.audio.beep(400, 0.12, 0.2)   # low beep
 
         # Open Wake Word
-        wake_cfg = (audio_cfg or {}).get("wake_word", {})  # OR pass cfg["wake_word"] directly
-        model_path = wake_cfg.get("model_path", "./soopa_nowvva.onnx")
-        self.wake_threshold = float(wake_cfg.get("threshold", 0.25))
-        self.wake_cooldown_s = float(wake_cfg.get("cooldown_s", 0.8))
+        model_path = self.wake_cfg.get("model_path", "./soopanova.onnx")
+        self.wake_threshold = float(self.wake_cfg.get("threshold", 0.05))
+        self.wake_cooldown_s = float(self.wake_cfg.get("cooldown_s", 0.8))
         self.post_session_silence_s = 0.4      # ringdown after playback stops
 
         # OWW params
