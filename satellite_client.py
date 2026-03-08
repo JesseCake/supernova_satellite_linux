@@ -356,20 +356,29 @@ class SatelliteClient:
         """
         Runs continuously while a session is active.
         Only sends AUD0 when _mic_active is set (i.e. state == LISTENING).
+        Discards audio when not active, but keeps the mic stream open/ready to minimise latency on state switch to LISTENING.
         """
         self.audio.open_input(frames_per_buffer=CHUNK)
 
         while self.sock is not None:
-            if not self._mic_active.wait(timeout=0.1):
-                continue
             try:
-                pcm = self.audio.read_input(CHUNK)
+                pcm =self.audio.read_input(CHUNK)
+            except Exception as e:
+                print(f"[mic] read error: {e}")
+                break
+
+            if self.sock is None:
+                break
+
+            if not self._mic_active.is_set():
+                # Not in LISTENING state — discard to keep buffer clear
+                continue
+
+            try:
                 self._send(b"AUD0", pcm)
             except Exception as e:
                 print(f"[mic] send error: {e}")
                 break
-            finally:
-                pass # close handled by _on_state_enter(IDLE)
 
     # -------------------------
     # State machine event loop
@@ -408,7 +417,7 @@ class SatelliteClient:
 
             elif tag == "TTS0":
                 duration_s = len(payload) / (SPK_RATE * SAMPLE_WIDTH)
-                print(f"[recv] TTS0 {len(payload)} bytes = {duration_s:.2f}s")
+                #print(f"[recv] TTS0 {len(payload)} bytes = {duration_s:.2f}s")
                 self.playback.enqueue(payload)
                 if self._state != State.SPEAKING:
                     self._set_state(State.SPEAKING)
