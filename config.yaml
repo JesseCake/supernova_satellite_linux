@@ -3,5 +3,5 @@ voice_server:
   port: 10400
 wake_word:
   model_path: "./soopanova.onnx"
-  threshold: 0.002
+  threshold: 0.01
   cooldown_s: 0.01

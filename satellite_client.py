@@ -80,6 +80,8 @@ INPUT_GAIN_TARGET_RMS  = 0.2
 INPUT_GAIN_MAX_DB      = 20.0
 INPUT_GAIN_NOISE_FLOOR = 0.05
 
+# I think we'll need to dig into the above settings, maybe take some recordings to hear what's happening and adjust amplification
+
 
 def list_devices():
     p = pyaudio.PyAudio()
@@ -313,6 +315,7 @@ class SatelliteClient:
         self.sock: Optional[socket.socket] = None
         self._receiver = None
         self._ready_event = threading.Event()  # set after RDY0
+        self._rdy0_event = threading.Event()   # set when server signals RDY0
 
     # ---------- networking ----------
     def connect(self):
@@ -336,7 +339,8 @@ class SatelliteClient:
             while True:
                 tag, payload = read_frame(self.sock)
                 if tag == b"TTS0":
-                    print(f"[recv] TTS0 {len(payload)} bytes")
+                    duration_s = len(payload) / (SPK_RATE * SAMPLE_WIDTH)
+                    #print(f"[recv] TTS0 {len(payload)} bytes = {duration_s:.2f}s of audio")
                     # Pre-mark speaking to block mic immediately
                     self.speaking_event.set()
                     # int16 mono 16k — play immediately
@@ -347,7 +351,8 @@ class SatelliteClient:
                     self.playback.enqueue(payload)
                 elif tag == b"RDY0":
                     print("[recv] RDY0")
-                    self._ready_event.set()
+                    #self._ready_event.set() # we don't want to immediately set ready, we want to wait until the client has finished streaming the tts audio out
+                    self._rdy0_event.set()  # server finished sending TTS, but we may still be playing it
                 elif tag == b"CLOS":
                     print("[recv] CLOS")
                     # server closing channel
@@ -376,6 +381,8 @@ class SatelliteClient:
         openWakeWord keeps internal state/buffer across predict() calls.
         After a wake/session, flush it with silence so we don't immediately retrigger.
         """
+        print(f"[satellite] Flushing wake model with {seconds:.1f}s of silence to ensure no false triggers")
+
         # If a reset method exists in your version, use it.
         for name in ("reset", "reset_states", "reset_state"):
             fn = getattr(self.oww, name, None)
@@ -422,14 +429,17 @@ class SatelliteClient:
             # If server is speaking, pause mic and wait
             if self.speaking_event.is_set():
                 if not was_speaking:
+                    print(f"[stream] mic pause triggered")
                     self.audio.pause_input()
                     was_speaking = True
                 time.sleep(0.01)
                 continue
             else:
                 if was_speaking:
-                    self.audio.resume_input()
+                    self.audio.resume_input() # attempting to fix bug where we were continuing to accumulate audio
+                    #self.audio.open_input(frames_per_buffer=CHUNK) # workaround to reset input stream state after pause/resume
                     was_speaking = False
+                    print(f"[stream] resumed mic, approx buffer backlog: {self.audio._in_stream.get_read_available()} frames")
 
             try:
                 pcm = self.audio.read_input(CHUNK)
@@ -513,6 +523,8 @@ class SatelliteClient:
         # Connect (or reconnect) to the server and send WAKE
         self.connect()
         self._ready_event.clear()
+        self._rdy0_event.clear()
+
         try:
             self._send(b"WAKE")
         except Exception as e:
@@ -520,14 +532,26 @@ class SatelliteClient:
             self.close()
             return
 
+        # Stage 1: wait for server to signal it has finished sending TTS
         # Wait for RDY0 (server says “I’m here” via TTS0 while we wait)
         print("[satellite] Waiting for RDY0 from server...")
-        if not self._ready_event.wait(timeout=5.0):
+        if not self._rdy0_event.wait(timeout=10.0):
             print("[satellite] Timed out waiting for RDY0.")
             self.close()
             return
 
-        print("[satellite] RDY0 received. Start talking.")
+        # Stage 2: wait for local playback to fully drain before opening mic
+        print("[satellite] RDY0 received. Waiting for playback to drain...")
+        if not self._wait_playback_drain(timeout_s=30.0):
+            print("[satellite] Warning: playback drain timed out, opening mic anyway.")
+
+        # Flush any mic buffer that accumulated during playback
+        self._flush_mic(CHUNK, 4)
+
+        # Now we're truly ready — unblock _stream_audio_session
+        self._ready_event.set()
+        print("[satellite] Playback drained. Start talking.")
+        
         # Stream until server ends the session (CLOS) or socket error
         self._stream_audio_session()
 
@@ -551,13 +575,6 @@ class SatelliteClient:
     def run_forever(self):
         try:
             while True:
-                ###########
-                # Choose one of the following modes:
-                ###########
-
-                # Mode 1: No wake word; talk once immediately
-                #self.talk_once_no_wake()
-                # Mode 2: Wake word enabled; wait for wake then talk
                 self.wake_and_talk_once()
         except KeyboardInterrupt:
             print("\n[satellite] Stopping...")
