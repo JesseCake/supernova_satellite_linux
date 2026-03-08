@@ -268,8 +268,7 @@ class SatelliteClient:
         time.sleep(0.08)
         self.audio.beep(400, 0.12, 0.3)
 
-        # Post session silence (to avoid clipping end of TTS or server beeps on next session's wake word)
-        self.post_session_silence_s = 0.4
+        self._mic_stop = threading.Event() 
 
     # -------------------------
     # State management
@@ -286,7 +285,6 @@ class SatelliteClient:
         """Side effects when entering a state — beeps, mic control, lights hook."""
         if state == State.IDLE:
             self._mic_active.clear()
-            self.audio.close_input()
 
         elif state == State.WAITING:
             self._mic_active.clear()
@@ -356,29 +354,24 @@ class SatelliteClient:
     # Mic sender thread
     # -------------------------
     def _mic_sender_loop(self):
-        """
-        Runs continuously while a session is active.
-        Only sends AUD0 when _mic_active is set (i.e. state == LISTENING).
-        Discards audio when not active, but keeps the mic stream open/ready to minimise latency on state switch to LISTENING.
-        """
+        self._mic_stop.clear()
         try:
             self.audio.open_input(frames_per_buffer=CHUNK)
         except Exception as e:
             print(f"[mic] failed to open input: {e}")
             return
 
-        while self.sock is not None:
+        while not self._mic_stop.is_set() and self.sock is not None:
             try:
-                pcm =self.audio.read_input(CHUNK)
+                pcm = self.audio.read_input(CHUNK)
             except Exception as e:
                 print(f"[mic] read error: {e}")
                 break
 
-            if self.sock is None:
+            if self.sock is None or self._mic_stop.is_set():
                 break
 
             if not self._mic_active.is_set():
-                # Not in LISTENING state — discard to keep buffer clear
                 continue
 
             try:
@@ -386,7 +379,8 @@ class SatelliteClient:
             except Exception as e:
                 print(f"[mic] send error: {e}")
                 break
-        
+
+        self.audio.close_input()
         print("[mic] sender thread exiting")
 
     # -------------------------
@@ -472,35 +466,36 @@ class SatelliteClient:
             self.oww.predict(silence)
 
     def _wait_for_wake_word(self):
-        """Opens mic, blocks until wake word detected, closes mic."""
-        self.audio.open_input(frames_per_buffer=self.oww_hop)
-        self.audio.flush_input(self.oww_hop, 3)
-
         print("[satellite] Listening for wake word...")
         next_allowed_t = 0.0
 
-        while True:
-            pcm   = self.audio.read_input(self.oww_hop)
-            frame = np.frombuffer(pcm, dtype=np.int16)
-            pred  = self.oww.predict(frame)
+        # Open mic just for wake word listening
+        self.audio.open_input(frames_per_buffer=self.oww_hop)
+        self.audio.flush_input(self.oww_hop, 3)
 
-            if not pred:
-                continue
+        try:
+            while True:
+                pcm   = self.audio.read_input(self.oww_hop)
+                frame = np.frombuffer(pcm, dtype=np.int16)
+                pred  = self.oww.predict(frame)
 
-            model_name = max(pred, key=pred.get)
-            score      = float(pred[model_name])
-            now        = time.time()
+                if not pred:
+                    continue
 
-            if now < next_allowed_t:
-                continue
+                model_name = max(pred, key=pred.get)
+                score      = float(pred[model_name])
+                now        = time.time()
 
-            if score >= self.wake_threshold:
-                print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
-                next_allowed_t = now + self.wake_cooldown_s
-                break
+                if now < next_allowed_t:
+                    continue
 
-        # Close wake-word mic stream — session will reopen for CHUNK-sized reads
-        self.audio.close_input()
+                if score >= self.wake_threshold:
+                    print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
+                    next_allowed_t = now + self.wake_cooldown_s
+                    break
+        finally:
+            # Close before mic sender thread opens its own stream
+            self.audio.close_input()
 
     # -------------------------
     # Main loop
@@ -510,41 +505,22 @@ class SatelliteClient:
             while True:
                 # Clear any stale events from previous session
                 while not self._event_q.empty():
-                    try:
-                        self._event_q.get_nowait()
-                    except Exception:
-                        break
+                    self._event_q.get_nowait()
+
 
                 self._set_state(State.IDLE)
-                self._mic_active.clear()
+                self._wait_for_wake_word() # owns mic stream, closes it before returning
 
-                self._wait_for_wake_word()
                 self._connect()
-
-                # Track threads so we can wait for them to die
-                recv_thread = None
-                mic_thread  = None
-
                 try:
                     self._run_session()
-                except Exception as e:
-                    print(f"[satellite] Session error: {e}")
                 finally:
-                    # Ensure mic is stopped and socket closed before anything else
                     self._mic_active.clear()
+                    self._mic_stop.set()   # signal mic thread to exit cleanly
                     self._disconnect()
-
-                    # Give threads a moment to exit cleanly
-                    time.sleep(0.3)
-
-                    # Reopen the input stream fresh for wake word listening
-                    try:
-                        self.audio.open_input(frames_per_buffer=self.oww_hop)
-                    except Exception as e:
-                        print(f"[satellite] Failed to reopen mic: {e}")
+                    time.sleep(0.1)        # brief wait for mic thread to close stream
 
                 self._flush_wake_model(seconds=2.0)
-                time.sleep(self.post_session_silence_s if hasattr(self, 'post_session_silence_s') else 0.4)
                 print("[satellite] Session complete, back to wake word listening.")
 
         except KeyboardInterrupt:
