@@ -355,8 +355,16 @@ class SatelliteClient:
                     self._rdy0_event.set()  # server finished sending TTS, but we may still be playing it
                 elif tag == b"CLOS":
                     print("[recv] CLOS")
+                    # Play closing beeps locally before tearing down
+                    for _ in range(3):
+                        self.audio.beep(300, 0.20, 0.6)
+                        time.sleep(0.15)
                     # server closing channel
                     self._ready_event.clear()
+                elif tag == b"THNK":
+                    print("[recv] THNK")
+                    # short higher beep to let user know processing has started:
+                    self.audio.beep(1000, 0.12, 0.3)
                 else:
                     # ignore unknown tags
                     print(f"[recv] Unknown tag {tag!r} ({len(payload)} bytes)")
@@ -451,8 +459,17 @@ class SatelliteClient:
             except Exception:
                 break
 
+    def _drain_then_listen(self):
+        """Wait for playback to drain, beep to signal listening, flush mic, set ready."""
+        if not self._wait_playback_drain(timeout_s=30.0):
+            print("[satellite] Warning: playback drain timed out, opening mic anyway.")
+        self._flush_mic(CHUNK, 4)
+        self.audio.beep(700, 0.12, 0.3)  # lower beep: now listening - in future we'll trigger a function for lights too
+        self._ready_event.set()
+        print("[satellite] Playback drained. Start talking.")
+
     def talk_once_no_wake(self):
-        """Start a session immediately (no Porcupine)."""
+        """Start a session immediately (no wake word). NOT USED NOW - was for testing"""
         self.connect()
         self._ready_event.clear()
 
@@ -541,16 +558,18 @@ class SatelliteClient:
             return
 
         # Stage 2: wait for local playback to fully drain before opening mic
-        print("[satellite] RDY0 received. Waiting for playback to drain...")
-        if not self._wait_playback_drain(timeout_s=30.0):
-            print("[satellite] Warning: playback drain timed out, opening mic anyway.")
+        #print("[satellite] RDY0 received. Waiting for playback to drain...")
+        #if not self._wait_playback_drain(timeout_s=30.0):
+        #    print("[satellite] Warning: playback drain timed out, opening mic anyway.")
+        self._drain_then_listen()
 
         # Flush any mic buffer that accumulated during playback
-        self._flush_mic(CHUNK, 4)
+        #self._flush_mic(CHUNK, 4)
 
         # Now we're truly ready — unblock _stream_audio_session
-        self._ready_event.set()
-        print("[satellite] Playback drained. Start talking.")
+        #self._ready_event.set()
+        #print("[satellite] Playback drained. Start talking.")
+        #self.audio.beep(700, 0.12, 0.3)  # ready to listen beep
         
         # Stream until server ends the session (CLOS) or socket error
         self._stream_audio_session()
