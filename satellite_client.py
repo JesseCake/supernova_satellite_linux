@@ -64,9 +64,32 @@ FORMAT          = pyaudio.paInt16
 CHUNK           = 1024     # mic frames sent to server per packet
 OUTPUT_CHUNK    = 4096     # playback buffer size
 
-INPUT_GAIN_TARGET_RMS  = 0.2
-INPUT_GAIN_MAX_DB      = 20.0
-INPUT_GAIN_NOISE_FLOOR = 0.05
+# -------------------------
+# Audio input gain constants
+# -------------------------
+
+# Target loudness level after gain is applied (0.0–1.0, where 1.0 = max before clipping).
+# Higher = louder output but more risk of clipping on loud frames.
+# For speech transcription, 0.15–0.25 is a safe range.
+INPUT_GAIN_TARGET_RMS = 0.2
+
+# Maximum boost the gain is allowed to apply, in decibels.
+# 12dB = ~4x amplification. 20dB = 10x.
+# Lower this if you're getting clipping on loud speech.
+# Raise it if very quiet microphones are still too quiet after gain.
+INPUT_GAIN_MAX_DB = 12.0
+
+# RMS level below which a frame is considered silence and gain is held steady.
+# Too low: background noise and hiss get boosted unnecessarily.
+# Too high: quiet speech gets ignored and arrives at the server too soft.
+# 0.01–0.03 works well for most microphones in a quiet room.
+INPUT_GAIN_NOISE_FLOOR = 0.03
+
+# How slowly the gain responds to changes in volume (0.0–1.0).
+# Higher = smoother, slower response — less pumping but slower to react.
+# Lower = faster response to volume changes — more reactive but can sound jumpy.
+# 0.90–0.95 for faster response, 0.95–0.98 for smoother.
+INPUT_GAIN_SMOOTHING = 0.90
 
 # -------------------------
 # State machine states
@@ -85,6 +108,7 @@ class State(Enum):
 class AudioIO:
     def __init__(self):
         self.p = pyaudio.PyAudio()
+        self._current_gain = 1.0
 
         try:
             self.out = self.p.open(
@@ -132,8 +156,16 @@ class AudioIO:
             except Exception:
                 pass
             self._in_stream = None
+    
+    def read_input_raw(self, n_frames: int) -> bytes:
+        """Raw read with no gain processing — for session audio sent to Whisper for speech recognition (doesn't like auto gain)."""
+        if not self._in_stream:
+            time.sleep(0.01)
+            return b"\x00" * (n_frames * SAMPLE_WIDTH)
+        return self._in_stream.read(n_frames, exception_on_overflow=False)
 
     def read_input(self, n_frames: int) -> bytes:
+        """Automatic gain adjustment only for wake word detection (struggles with low gain)"""
         if not self._in_stream:
             time.sleep(0.01)
             return b"\x00" * (n_frames * SAMPLE_WIDTH)
@@ -143,10 +175,22 @@ class AudioIO:
         # Auto-gain
         arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(arr ** 2)))
+
         if rms >= INPUT_GAIN_NOISE_FLOOR:
             max_gain = 10.0 ** (INPUT_GAIN_MAX_DB / 20.0)
-            gain = min(INPUT_GAIN_TARGET_RMS / rms, max_gain)
-            arr = np.clip(arr * gain, -1.0, 1.0)
+            target_gain = min(INPUT_GAIN_TARGET_RMS / rms, max_gain)
+        else:
+            target_gain = self._current_gain  # hold during silence
+
+        self._current_gain = (INPUT_GAIN_SMOOTHING * self._current_gain +
+                            (1.0 - INPUT_GAIN_SMOOTHING) * target_gain)
+
+        arr = np.clip(arr * self._current_gain, -1.0, 1.0)
+
+        clip_count = int(np.sum(np.abs(arr) >= 0.999))
+        if clip_count > 0:
+            print(f"[audio] !! CLIPPING !! {clip_count} samples (rms={rms:.4f})")
+
         return (arr * 32767.0).astype(np.int16).tobytes()
 
     def flush_input(self, n_frames: int, count: int):
@@ -383,7 +427,8 @@ class SatelliteClient:
                 continue
 
             try:
-                pcm = self.audio.read_input(CHUNK)
+                # use the raw mic capture instead of auto gained input as ASR struggles with auto gain
+                pcm = self.audio.read_input_raw(CHUNK)
             except Exception as e:
                 print(f"[mic] read error: {e}")
                 break
