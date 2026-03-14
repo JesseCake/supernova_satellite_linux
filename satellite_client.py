@@ -187,9 +187,9 @@ class AudioIO:
 
         arr = np.clip(arr * self._current_gain, -1.0, 1.0)
 
-        clip_count = int(np.sum(np.abs(arr) >= 0.999))
-        if clip_count > 0:
-            print(f"[audio] !! CLIPPING !! {clip_count} samples (rms={rms:.4f})")
+        #clip_count = int(np.sum(np.abs(arr) >= 0.999))
+        #if clip_count > 0:
+        #    print(f"[audio] !! CLIPPING !! {clip_count} samples (rms={rms:.4f})")
 
         return (arr * 32767.0).astype(np.int16).tobytes()
 
