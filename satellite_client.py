@@ -161,11 +161,19 @@ class AudioIO:
         self.out.write(pcm_bytes)
 
     def beep(self, freq=800.0, duration=0.15, volume=0.4, rate=16000):
+        # directly play beep to soundcard
         n = int(rate * duration)
         t = np.arange(n, dtype=np.float32) / rate
         wave = np.sin(2 * np.pi * freq * t) * volume
         pcm = (np.clip(wave, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         self.play_bytes(pcm)
+    
+    def beep_pcm(self, freq=800.0, duration=0.15, volume=0.4, rate=16000) -> bytes:
+        # create a pcm of beep instead of playing directly to sound card
+        n = int(rate * duration)
+        t = np.arange(n, dtype=np.float32) / rate
+        wave = np.sin(2 * np.pi * freq * t) * volume
+        return (np.clip(wave, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
     def close(self):
         try:
@@ -294,7 +302,8 @@ class SatelliteClient:
         elif state == State.LISTENING:
             # Lower beep: ready to listen
             self.audio.beep(700, 0.12, 0.3)
-            self.audio.flush_input(CHUNK, 4)
+            # flushing now happens inside mic thread
+            #self.audio.flush_input(CHUNK, 4)
             self._mic_active.set()
 
         elif state == State.THINKING:
@@ -361,7 +370,18 @@ class SatelliteClient:
             print(f"[mic] failed to open input: {e}")
             return
 
+        # flushing:
+        self.audio.flush_input(CHUNK, 4)
+
         while not self._mic_stop.is_set() and self.sock is not None:
+            if not self._mic_active.is_set():
+                # block efficiently instead of spinning
+                self._mic_active.wait(timeout=0.1)
+                # flush on wake up to discard audio buffered while we were paused:
+                if self._mic_active.is_set():
+                    self.audio.flush_input(CHUNK, 4)
+                continue
+
             try:
                 pcm = self.audio.read_input(CHUNK)
             except Exception as e:
@@ -439,7 +459,10 @@ class SatelliteClient:
 
             elif tag == "THNK":
                 print("[recv] THNK")
-                self.audio.beep(1000, 0.12, 0.3)
+                # change to generate beep PCM and enqueue it so it plays after any remaining TTS?
+                beep_pcm = self.audio.beep_pcm(1000, 0.12, 0.3)
+                self.playback.enqueue(beep_pcm)
+                #self.audio.beep(1000, 0.12, 0.3)
                 self._set_state(State.THINKING)
 
             elif tag == "CLOS":
@@ -518,7 +541,7 @@ class SatelliteClient:
                     self._mic_active.clear()
                     self._mic_stop.set()   # signal mic thread to exit cleanly
                     self._disconnect()
-                    time.sleep(0.1)        # brief wait for mic thread to close stream
+                    time.sleep(1)        # brief wait for mic thread to close stream
 
                 self._flush_wake_model(seconds=2.0)
                 print("[satellite] Session complete, back to wake word listening.")
