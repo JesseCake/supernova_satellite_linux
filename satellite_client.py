@@ -301,7 +301,9 @@ class SatelliteClient:
         self.wake_cooldown_s  = float(wake_cfg.get("cooldown_s", 0.8))
         self.oww_hop          = 1280
         ensure_oww_resources()
-        self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
+        # we're going to try destroying and creating the wake word object to see if we get better performance:
+        #self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
+        self.oww = None
 
         # Networking
         self.sock: Optional[socket.socket] = None
@@ -522,6 +524,7 @@ class SatelliteClient:
     # Wake word loop
     # -------------------------
     def _flush_wake_model(self, seconds: float = 2.0):
+        # WE MAY NOT USE THIS ANYMORE
         for name in ("reset", "reset_states", "reset_state"):
             fn = getattr(self.oww, name, None)
             if callable(fn):
@@ -534,7 +537,15 @@ class SatelliteClient:
             self.oww.predict(silence)
 
     def _wait_for_wake_word(self):
+        
+        print("[satellite] Setting up wake word...", end="")
+        # Fresh model every time — no stale state possible
+        model_path = self.wake_cfg.get("model_path", "./soopanova.onnx")
+        self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
+        print("done")
+        
         print("[satellite] Listening for wake word...")
+        
         next_allowed_t = 0.0
 
         # Open mic just for wake word listening
@@ -561,9 +572,13 @@ class SatelliteClient:
                     print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
                     next_allowed_t = now + self.wake_cooldown_s
                     break
+                elif score > 0.001 and score < self.wake_threshold:
+                    print(f"[satellite] Poor recognition (score={score:.3f})")
         finally:
             # Close before mic sender thread opens its own stream
             self.audio.close_input()
+            # Destroy the wake word object
+            self.oww = None
 
     # -------------------------
     # Main loop
@@ -588,7 +603,8 @@ class SatelliteClient:
                     self._disconnect()
                     time.sleep(1)        # brief wait for mic thread to close stream
 
-                self._flush_wake_model(seconds=2.0)
+                # we're not needing to flush now as we're destroying and creating wake word on demand
+                #self._flush_wake_model(seconds=2.0)
                 print("[satellite] Session complete, back to wake word listening.")
 
         except KeyboardInterrupt:
