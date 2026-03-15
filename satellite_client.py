@@ -85,11 +85,13 @@ INPUT_GAIN_MAX_DB = 12.0
 # 0.01–0.03 works well for most microphones in a quiet room.
 INPUT_GAIN_NOISE_FLOOR = 0.03
 
-# How slowly the gain responds to changes in volume (0.0–1.0).
-# Higher = smoother, slower response — less pumping but slower to react.
-# Lower = faster response to volume changes — more reactive but can sound jumpy.
-# 0.90–0.95 for faster response, 0.95–0.98 for smoother.
-INPUT_GAIN_SMOOTHING = 0.90
+# How quickly gain drops when a loud signal appears (0.0–1.0).
+# Lower = faster clamp. 0.60–0.75 reacts within one or two hops.
+INPUT_GAIN_SMOOTHING_ATTACK  = 0.70
+
+# How slowly gain recovers during quiet/silence (0.0–1.0).
+# Higher = slower creep upward, less pumping. 0.95–0.98 is safe.
+INPUT_GAIN_SMOOTHING_RELEASE = 0.95
 
 # -------------------------
 # State machine states
@@ -182,8 +184,16 @@ class AudioIO:
         else:
             target_gain = self._current_gain  # hold during silence
 
-        self._current_gain = (INPUT_GAIN_SMOOTHING * self._current_gain +
-                            (1.0 - INPUT_GAIN_SMOOTHING) * target_gain)
+        # Asymmetric attack/release:
+        # Drop gain quickly when signal is loud (avoids clipping on sudden speech)
+        # Recover gain slowly when signal is quiet (avoids pumping during silence)
+        if target_gain < self._current_gain:
+            alpha = INPUT_GAIN_SMOOTHING_ATTACK    # fast — gain going down
+        else:
+            alpha = INPUT_GAIN_SMOOTHING_RELEASE   # slow — gain going up
+
+        self._current_gain = (alpha * self._current_gain +
+                         (1.0 - alpha) * target_gain)
 
         arr = np.clip(arr * self._current_gain, -1.0, 1.0)
 
