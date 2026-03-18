@@ -331,7 +331,7 @@ class SatelliteClient:
         model_path            = wake_cfg.get("model_path", "./soopanova.onnx")
         self.wake_threshold   = float(wake_cfg.get("threshold", 0.05))
         self.wake_cooldown_s  = float(wake_cfg.get("cooldown_s", 0.8))
-        self.oww_hop          = 1280
+        self.oww_hop          = 2560  # default min = 1280
         ensure_oww_resources()
         # we're going to try destroying and creating the wake word object to see if we get better performance:
         #self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
@@ -573,7 +573,11 @@ class SatelliteClient:
         print("[satellite] Setting up wake word...", end="")
         # Fresh model every time — no stale state possible
         model_path = self.wake_cfg.get("model_path", "./soopanova.onnx")
-        self.oww = openwakeword.Model(wakeword_model_paths=[model_path])
+        self.oww = openwakeword.Model(
+            wakeword_model_paths=[model_path],
+            vad_threshold=float(self.wake_cfg.get("vad_threshold", 0.5)),
+            #enable_speex_noise_suppression=True  # TODO: explore this?
+            )
         print("done")
         
         print("[satellite] Listening for wake word...")

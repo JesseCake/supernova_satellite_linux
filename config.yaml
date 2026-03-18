@@ -2,11 +2,12 @@ voice_server:
   host: "jetson.lan"
   port: 10400
 wake_word:
-  model_path: "./soopanova.onnx"
+  model_path: "./supanova.onnx"
   threshold: 0.2
+  vad_threshold: 0.3
   cooldown_s: 0.01
 input_gain:
-  target_rms: 0.15
+  target_rms: 0.4
   max_db: 5.0
   noise_floor: 0.01
   smoothing_attack: 0.50  # lower = bring down gain reaction slower

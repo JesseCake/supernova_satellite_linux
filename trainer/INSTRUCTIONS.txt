@@ -1,0 +1,9 @@
+THESE ARE PATCHED BLOBS from Google Collab Notebook
+
+You can put these into chunks in a collab notebook and train your own custom words
+
+Apparently because of the nature of some of the datasets used for background sound etc this trained word cannot be used in a commercial situation.
+
+This is why I provide training info here for you to use. 
+This is a variation (I've nodded a fair chunk of it to work with modern python) of a collab notebook that has been going around 
+upgraded from the original bare bones one from OpenWakeWord.
