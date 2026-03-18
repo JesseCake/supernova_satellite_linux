@@ -3,5 +3,15 @@ voice_server:
   port: 10400
 wake_word:
   model_path: "./soopanova.onnx"
-  threshold: 0.1
+  threshold: 0.2
   cooldown_s: 0.01
+input_gain:
+  target_rms: 0.15
+  max_db: 5.0
+  noise_floor: 0.01
+  smoothing_attack: 0.50  # lower = bring down gain reaction slower
+  smoothing_release: 0.30  # lower = raise gain reaction slower
+# Turn these on to troubleshoot and tune the gain reaction and noise floor:
+debug:
+  gain_bar: false
+  clip_warnings: false

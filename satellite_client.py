@@ -14,6 +14,7 @@ import openwakeword
 from pathlib import Path
 import importlib.resources as ir
 
+
 # -------------------------
 # OpenWakeWord resource check
 # -------------------------
@@ -92,6 +93,17 @@ INPUT_GAIN_SMOOTHING_ATTACK  = 0.70
 # How slowly gain recovers during quiet/silence (0.0–1.0).
 # Higher = slower creep upward, less pumping. 0.95–0.98 is safe.
 INPUT_GAIN_SMOOTHING_RELEASE = 0.95
+
+# -------------------------
+# Debug flag (set from config)
+# -------------------------
+DEBUG_GAIN = False  # overridden by load_config() before client starts
+
+def _gain_bar(gain: float, rms: float = 0.0, max_db: float = INPUT_GAIN_MAX_DB, width: int = 40) -> str:
+    max_gain = 10.0 ** (max_db / 20.0)
+    ratio = min(gain / max_gain, 1.0)
+    filled = int(ratio * width)
+    return f"\r[{'#' * filled}{' ' * (width - filled)}] {gain:.3f}x ({20 * np.log10(max(gain, 1e-9)):.1f}dB) rms={rms:.4f}"
 
 # -------------------------
 # State machine states
@@ -194,12 +206,17 @@ class AudioIO:
 
         self._current_gain = (alpha * self._current_gain +
                          (1.0 - alpha) * target_gain)
+        
+        if DEBUG_GAIN:
+            available = self.input_available_frames()
+            print(_gain_bar(self._current_gain, rms) + f" buf={available}", end="", flush=True)
 
         arr = np.clip(arr * self._current_gain, -1.0, 1.0)
 
-        #clip_count = int(np.sum(np.abs(arr) >= 0.999))
-        #if clip_count > 0:
-        #    print(f"[audio] !! CLIPPING !! {clip_count} samples (rms={rms:.4f})")
+        if DEBUG_CLIP:
+            clip_count = int(np.sum(np.abs(arr) >= 0.999))
+            if clip_count > 0:
+                print(f"\n[audio] !! CLIPPING !! {clip_count} samples (rms={rms:.4f})")
 
         return (arr * 32767.0).astype(np.int16).tobytes()
 
@@ -210,6 +227,11 @@ class AudioIO:
                 self.read_input(n_frames)
             except Exception:
                 break
+    
+    def input_available_frames(self) -> int:
+        if not self._in_stream:
+            return 0
+        return self._in_stream.get_read_available()
 
     def play_bytes(self, pcm_bytes: bytes):
         self.out.write(pcm_bytes)
@@ -565,6 +587,14 @@ class SatelliteClient:
         try:
             while True:
                 pcm   = self.audio.read_input(self.oww_hop)
+
+                available = self.audio.input_available_frames()
+                if available > self.oww_hop * 2:
+                    print(f"\n[wake] buffer lag ({available} frames), draining...")
+                    self.audio.flush_input(self.oww_hop, available // self.oww_hop)
+                    continue
+
+
                 frame = np.frombuffer(pcm, dtype=np.int16)
                 pred  = self.oww.predict(frame)
 
@@ -579,11 +609,11 @@ class SatelliteClient:
                     continue
 
                 if score >= self.wake_threshold:
-                    print(f"[satellite] Wake word '{model_name}' detected (score={score:.3f})")
+                    print(f"\n[satellite] Wake word '{model_name}' detected (score={score:.3f})")
                     next_allowed_t = now + self.wake_cooldown_s
                     break
                 elif score > 0.001 and score < self.wake_threshold:
-                    print(f"[satellite] Poor recognition (score={score:.3f})")
+                    print(f"\n[satellite] Poor recognition (score={score:.3f})")
         finally:
             # Close before mic sender thread opens its own stream
             self.audio.close_input()
@@ -632,6 +662,17 @@ def load_config(path="config.yaml"):
 
 if __name__ == "__main__":
     cfg = load_config()
+
+    gain_cfg = cfg.get("input_gain", {})
+    INPUT_GAIN_TARGET_RMS        = gain_cfg.get("target_rms",         INPUT_GAIN_TARGET_RMS)
+    INPUT_GAIN_MAX_DB            = gain_cfg.get("max_db",             INPUT_GAIN_MAX_DB)
+    INPUT_GAIN_NOISE_FLOOR       = gain_cfg.get("noise_floor",        INPUT_GAIN_NOISE_FLOOR)
+    INPUT_GAIN_SMOOTHING_ATTACK  = gain_cfg.get("smoothing_attack",   INPUT_GAIN_SMOOTHING_ATTACK)
+    INPUT_GAIN_SMOOTHING_RELEASE = gain_cfg.get("smoothing_release",  INPUT_GAIN_SMOOTHING_RELEASE)
+
+    DEBUG_GAIN = cfg.get("debug", {}).get("gain_bar", False)
+    DEBUG_CLIP         = cfg.get("debug", {}).get("clip_warnings", False)
+
     client = SatelliteClient(
         server_host=cfg["voice_server"]["host"],
         server_port=int(cfg["voice_server"]["port"]),
