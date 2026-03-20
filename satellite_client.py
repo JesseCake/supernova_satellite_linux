@@ -616,7 +616,7 @@ class SatelliteClient:
                     print(f"\n[satellite] Wake word '{model_name}' detected (score={score:.3f})")
                     next_allowed_t = now + self.wake_cooldown_s
                     break
-                elif score > 0.001 and score < self.wake_threshold:
+                elif score > 0.002 and score < self.wake_threshold:
                     print(f"\n[satellite] Poor recognition (score={score:.3f})")
         finally:
             # Close before mic sender thread opens its own stream

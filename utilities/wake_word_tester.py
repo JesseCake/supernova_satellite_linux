@@ -24,7 +24,7 @@ import openwakeword
 MIC_RATE     = 16000
 SAMPLE_WIDTH = 2        # int16
 FORMAT       = pyaudio.paInt16
-OWW_HOP      = 3640     # frames per prediction hop
+OWW_HOP      = 1820     # frames per prediction hop
 OUTPUT_CHUNK = 4096
 
 # -------------------------
