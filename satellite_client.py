@@ -651,7 +651,7 @@ class SatelliteClient:
                         # e.g. an announcement. Print it for now; future work
                         # could pre-populate it as the first assistant turn.
                         print(f"[satellite] Server-initiated CALL: {payload.decode('utf-8', errors='replace')!r}")
-                        self.audio.inbound_alert(repeats=3)
+                        self.audio.inbound_alert()
                     break
 
                 elif tag == "TTS0" or tag == "BEEP":
