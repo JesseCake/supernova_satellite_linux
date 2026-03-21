@@ -1,3 +1,4 @@
+friendly_name: "Kitchen"
 voice_server:
   host: "jetson.lan"
   port: 10400

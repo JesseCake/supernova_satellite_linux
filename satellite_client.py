@@ -60,6 +60,7 @@ import numpy as np
 import pyaudio
 import yaml
 import openwakeword
+import json
 
 from pathlib import Path
 import importlib.resources as ir
@@ -310,8 +311,7 @@ class SatelliteClient:
       then re-register with HELO and return to IDLE.
     """
 
-    def __init__(self, server_host: str, server_port: int,
-                 wake_cfg: dict, endpoint_id: str):
+    def __init__(self, server_host: str, server_port: int, wake_cfg: dict, endpoint_id: str, friendly_name: str = ""):
         self.server_host = server_host
         self.server_port = server_port
         self.wake_cfg    = wake_cfg
@@ -320,6 +320,7 @@ class SatelliteClient:
         # Sent in the HELO frame on connect. Should be stable across restarts
         # (e.g. hostname, MAC address, or a configured name like "kitchen").
         self.endpoint_id = endpoint_id
+        self.friendly_name = friendly_name
 
         # ── Audio ─────────────────────────────────────────────────────────────
         self.audio    = AudioIO()
@@ -406,7 +407,12 @@ class SatelliteClient:
             except Exception: pass
         self.sock = socket.create_connection((self.server_host, self.server_port))
         # Register immediately so the server knows who we are.
-        self._send(b"HELO", self.endpoint_id.encode("utf-8"))
+        helo = json.dumps({
+            "id":   self.endpoint_id,
+            "name": self.friendly_name,
+        }).encode("utf-8")
+        # we'll send a friendly name we can configure so each endpoint can have nice names for the agent to use in future outgoing calls
+        self._send(b"HELO", helo)
         print(f"[satellite] Connected and registered as {self.endpoint_id!r}")
 
     def _disconnect(self):
@@ -755,5 +761,6 @@ if __name__ == "__main__":
         server_port=int(cfg["voice_server"]["port"]),
         wake_cfg=cfg.get("wake_word", {}),
         endpoint_id=endpoint_id,
+        friendly_name=cfg.get("friendly_name", endpoint_id)
     )
     client.run_forever()
