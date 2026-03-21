@@ -237,55 +237,42 @@ class AudioIO:
         wave = np.sin(2 * np.pi * freq * t) * volume
         return (np.clip(wave, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
-    def inbound_alert(self, rate: int = SPK_RATE):
+    def inbound_alert(self, repeats: int = 2, rate: int = SPK_RATE):
         """
-        XDR/SDR cassette tone burst — the ascending quality-control tones
-        used by Capitol/EMI on pre-recorded cassettes. 15 sine wave tones
-        stepping up from 50Hz to 18300Hz, each 127ms with 23ms gaps.
+        XDR/SDR cassette tone burst — ascending quality-control tones used by
+        Capitol/EMI on pre-recorded cassettes, truncated to the audible range.
+        Used as the alert tone for server-initiated inbound calls.
         """
-        # Exact frequencies from the original SDR (Capitol/EMI Canada, 1982)
         frequencies = [
             50, 100, 250, 400, 640, 1010, 1610,
-            4000, 6350, 8100, 10100, 12600, 15200, 18300
+            4000, 6350, 8100,
         ]
-        burst_len = 0.127   # seconds per tone
-        gap_len   = 0.023   # seconds between tones
-        volume    = 0.75
+        volume    = 0.45
+        burst_len = 0.18
+        gap_len   = 0.023
 
-        for freq in frequencies:
-            n    = int(rate * burst_len)
-            t    = np.linspace(0, burst_len, n, False)
-            tone = np.sin(2 * np.pi * freq * t) * volume
+        for rep in range(repeats):
+            for i, freq in enumerate(frequencies):
+                # Ramp volume slightly for higher frequencies to compensate
+                # for hearing rolloff — makes the sequence feel more even.
+                vol  = volume + (i / len(frequencies)) * 0.12
+                vol  = min(vol, 1.0)
+                n    = int(rate * burst_len)
+                t    = np.linspace(0, burst_len, n, False)
+                tone = np.sin(2 * np.pi * freq * t) * vol
+                fade = int(0.004 * rate)
+                tone[:fade]  *= np.linspace(0, 1, fade)
+                tone[-fade:] *= np.linspace(1, 0, fade)
+                self.play_bytes(
+                    (np.clip(tone, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                )
+                silence = np.zeros(int(rate * gap_len), dtype=np.float32)
+                self.play_bytes((silence * 32767).astype(np.int16).tobytes())
 
-            # Smooth edges to avoid clicks
-            fade = int(0.004 * rate)
-            tone[:fade]  *= np.linspace(0, 1, fade)
-            tone[-fade:] *= np.linspace(1, 0, fade)
-
-            self.play_bytes(
-                (np.clip(tone, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            )
-
-            # Gap between tones
-            silence = np.zeros(int(rate * gap_len), dtype=np.float32)
-            self.play_bytes((silence * 32767).astype(np.int16).tobytes())
-
-        # Final long tone at 15200Hz for 820ms (as per the spec)
-        n    = int(rate * 0.820)
-        t    = np.linspace(0, 0.820, n, False)
-        tone = np.sin(2 * np.pi * 15200 * t) * volume
-        fade = int(0.004 * rate)
-        tone[:fade]  *= np.linspace(0, 1, fade)
-        tone[-fade:] *= np.linspace(1, 0, fade)
-        self.play_bytes((np.clip(tone, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
-
-    def close(self):
-        try:
-            self.close_input()
-            if self.out: self.out.close()
-            self.p.terminate()
-        except Exception: pass
-
+            # Brief pause between repeats (not after the last one)
+            if rep < repeats - 1:
+                silence = np.zeros(int(rate * 0.3), dtype=np.float32)
+                self.play_bytes((silence * 32767).astype(np.int16).tobytes())
 
 # ── PlaybackThread ────────────────────────────────────────────────────────────
 
