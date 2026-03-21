@@ -237,6 +237,48 @@ class AudioIO:
         wave = np.sin(2 * np.pi * freq * t) * volume
         return (np.clip(wave, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
+    def inbound_alert(self, rate: int = SPK_RATE):
+        """
+        XDR/SDR cassette tone burst — the ascending quality-control tones
+        used by Capitol/EMI on pre-recorded cassettes. 15 sine wave tones
+        stepping up from 50Hz to 18300Hz, each 127ms with 23ms gaps.
+        """
+        # Exact frequencies from the original SDR (Capitol/EMI Canada, 1982)
+        frequencies = [
+            50, 100, 250, 400, 640, 1010, 1610,
+            4000, 6350, 8100, 10100, 12600, 15200, 18300
+        ]
+        burst_len = 0.127   # seconds per tone
+        gap_len   = 0.023   # seconds between tones
+        volume    = 0.75
+
+        for freq in frequencies:
+            n    = int(rate * burst_len)
+            t    = np.linspace(0, burst_len, n, False)
+            tone = np.sin(2 * np.pi * freq * t) * volume
+
+            # Smooth edges to avoid clicks
+            fade = int(0.004 * rate)
+            tone[:fade]  *= np.linspace(0, 1, fade)
+            tone[-fade:] *= np.linspace(1, 0, fade)
+
+            self.play_bytes(
+                (np.clip(tone, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            )
+
+            # Gap between tones
+            silence = np.zeros(int(rate * gap_len), dtype=np.float32)
+            self.play_bytes((silence * 32767).astype(np.int16).tobytes())
+
+        # Final long tone at 15200Hz for 820ms (as per the spec)
+        n    = int(rate * 0.820)
+        t    = np.linspace(0, 0.820, n, False)
+        tone = np.sin(2 * np.pi * 15200 * t) * volume
+        fade = int(0.004 * rate)
+        tone[:fade]  *= np.linspace(0, 1, fade)
+        tone[-fade:] *= np.linspace(1, 0, fade)
+        self.play_bytes((np.clip(tone, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+
     def close(self):
         try:
             self.close_input()
@@ -601,11 +643,15 @@ class SatelliteClient:
                 elif tag in ("_WAKE", "CALL"):
                     # Wake word detected locally, OR server pushed a CALL frame.
                     self._stop_wake_word_listener()
+                    # Store the CALL payload so we can forward it in the WAKE frame.
+                    # Empty bytes for a local wake word, announcement text for CALL.
+                    self._pending_call_payload = payload if tag == "CALL" else b""
                     if tag == "CALL" and payload:
                         # Server can include optional text in CALL payload,
                         # e.g. an announcement. Print it for now; future work
                         # could pre-populate it as the first assistant turn.
                         print(f"[satellite] Server-initiated CALL: {payload.decode('utf-8', errors='replace')!r}")
+                        self.audio.inbound_alert(repeats=3)
                     break
 
                 elif tag == "TTS0" or tag == "BEEP":
@@ -636,7 +682,10 @@ class SatelliteClient:
                 self._set_state(State.LISTENING)
             else:
                 try:
-                    self._send(b"WAKE")
+                    # Forward the CALL payload so the server has the announcement
+                    # context. Empty bytes for a normal local wake word.
+                    self._send(b"WAKE", getattr(self, '_pending_call_payload', b""))
+                    self._pending_call_payload = b""
                 except Exception as e:
                     print(f"[session] Error sending WAKE: {e}")
                     return
