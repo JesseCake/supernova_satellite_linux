@@ -292,7 +292,7 @@ class PlaybackThread(threading.Thread):
     def is_playing(self) -> bool:
         return self._playing
 
-    def wait_until_done(self, timeout_s: float = 30.0) -> bool:
+    def wait_until_done(self, timeout_s: float = 180.0) -> bool:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if not self._playing and self.queue.empty():
@@ -428,7 +428,7 @@ class SatelliteClient:
             # CLOS received — drain audio and play closing beeps, then go IDLE.
             # The connection is NOT closed here.
             self._mic_active.clear()
-            self.playback.wait_until_done(timeout_s=30.0)
+            self.playback.wait_until_done(timeout_s=180.0)
             for _ in range(3):
                 self.audio.beep(300, 0.20, 0.6)
                 time.sleep(0.15)
