@@ -410,6 +410,12 @@ class SatelliteClient:
         elif state == State.LISTENING:
             # RDY0 received, playback drained — open the mic.
             self.audio.beep(700, 0.12, 0.3)
+            try:
+                # Mark the stream: everything the server reads after this
+                # frame is fresh audio for the new listening window.
+                self._send(b"MIC1")
+            except Exception as e:
+                print(f"[state] failed to send MIC1: {e}")
             self._mic_active.set()
 
         elif state == State.THINKING:
@@ -683,7 +689,9 @@ class SatelliteClient:
                     tag, payload = self._event_q.get(timeout=60.0)
                 except queue.Empty:
                     print("[session] Timed out waiting for server event.")
-                    return
+                    self._set_state(State.CLOSING)   # drains audio, closing beeps, mic off
+                    session_done = True
+                    continue
 
                 if tag == "_DISCONNECT":
                     return
