@@ -713,9 +713,16 @@ class SatelliteClient:
                     self._set_state(State.LISTENING)
 
                 elif tag == "THNK":
-                    beep_pcm = self.audio.beep_pcm(1000, 0.12, 0.3)
-                    self.playback.enqueue(beep_pcm)
-                    self._set_state(State.THINKING)
+                    if self._state != State.THINKING:
+                        print("[recv] THNK — server processing")
+                        # 150ms of digital silence primes the output stream
+                        # out of its idle/underrun state so the short beep
+                        # isn't clipped — the first write after seconds of
+                        # output silence is often partially swallowed on
+                        # USB audio devices.
+                        silence = b"\x00" * (int(0.15 * SPK_RATE) * SAMPLE_WIDTH)
+                        self.playback.enqueue(silence + self.audio.beep_pcm(1000, 0.12, 0.3))
+                        self._set_state(State.THINKING)
 
                 elif tag == "CLOS":
                     # Session ended. Connection stays open.
